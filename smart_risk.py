@@ -635,6 +635,362 @@ def find_smart_money_zones(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 2.7) MULTI-TIMEFRAME CONFLUENCE — تحليل 3 إطارات زمنية
+# ═══════════════════════════════════════════════════════════════════════
+def analyze_timeframe_bias(df: pd.DataFrame, lookback: int = 50) -> Dict:
+    """يحلل اتجاه إطار زمني واحد ويرجّع bias.
+    
+    Returns: {
+        "bias": "BULLISH" / "BEARISH" / "NEUTRAL",
+        "strength": 1-10,
+        "ema_trend": str,
+        "structure": str,
+        "rsi": float,
+        "score": int,           # bull_score - bear_score
+    }
+    """
+    if df is None or df.empty or len(df) < 30:
+        return {"bias": "UNKNOWN", "strength": 0, "score": 0,
+                "ema_trend": "—", "structure": "—", "rsi": 50}
+    
+    closes = df["Close"]
+    
+    # EMA trend
+    ema_20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
+    ema_50 = closes.ewm(span=50, adjust=False).mean().iloc[-1]
+    if len(closes) >= 200:
+        ema_200 = closes.ewm(span=200, adjust=False).mean().iloc[-1]
+    else:
+        ema_200 = ema_50
+    
+    last = float(closes.iloc[-1])
+    
+    bull_score = 0
+    bear_score = 0
+    
+    # ─── 1. EMA Stack ───
+    if last > ema_20 > ema_50 > ema_200:
+        bull_score += 3
+        ema_trend = "🟢 صعودي قوي"
+    elif last > ema_20 > ema_50:
+        bull_score += 2
+        ema_trend = "🟢 صعودي"
+    elif last < ema_20 < ema_50 < ema_200:
+        bear_score += 3
+        ema_trend = "🔴 هبوطي قوي"
+    elif last < ema_20 < ema_50:
+        bear_score += 2
+        ema_trend = "🔴 هبوطي"
+    elif last > ema_20:
+        bull_score += 1
+        ema_trend = "🟡 صعودي ضعيف"
+    elif last < ema_20:
+        bear_score += 1
+        ema_trend = "🟡 هبوطي ضعيف"
+    else:
+        ema_trend = "⚪ متذبذب"
+    
+    # ─── 2. Market Structure (Higher Highs/Lower Lows) ───
+    recent = df.iloc[-min(20, len(df)):]
+    swings_high = []
+    swings_low = []
+    for i in range(2, len(recent) - 2):
+        if (recent["High"].iloc[i] > recent["High"].iloc[i-1] 
+            and recent["High"].iloc[i] > recent["High"].iloc[i+1]
+            and recent["High"].iloc[i] > recent["High"].iloc[i-2]
+            and recent["High"].iloc[i] > recent["High"].iloc[i+2]):
+            swings_high.append(float(recent["High"].iloc[i]))
+        if (recent["Low"].iloc[i] < recent["Low"].iloc[i-1]
+            and recent["Low"].iloc[i] < recent["Low"].iloc[i+1]
+            and recent["Low"].iloc[i] < recent["Low"].iloc[i-2]
+            and recent["Low"].iloc[i] < recent["Low"].iloc[i+2]):
+            swings_low.append(float(recent["Low"].iloc[i]))
+    
+    structure = "متذبذب"
+    if len(swings_high) >= 2 and swings_high[-1] > swings_high[-2]:
+        if len(swings_low) >= 2 and swings_low[-1] > swings_low[-2]:
+            structure = "🟢 HH+HL (صعودي)"
+            bull_score += 2
+    elif len(swings_low) >= 2 and swings_low[-1] < swings_low[-2]:
+        if len(swings_high) >= 2 and swings_high[-1] < swings_high[-2]:
+            structure = "🔴 LH+LL (هبوطي)"
+            bear_score += 2
+    
+    # ─── 3. RSI ───
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, float('nan'))
+    rsi = 100 - 100 / (1 + rs)
+    rsi_now = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
+    
+    if 50 < rsi_now < 70:
+        bull_score += 1
+    elif rsi_now >= 70:
+        bear_score += 1  # ذروة شراء = إشارة عكس محتملة
+    elif 30 < rsi_now < 50:
+        bear_score += 1
+    elif rsi_now <= 30:
+        bull_score += 1  # ذروة بيع = إشارة عكس
+    
+    # ─── 4. Recent momentum (آخر 10 شموع) ───
+    if len(closes) >= 10:
+        change_10 = (closes.iloc[-1] - closes.iloc[-10]) / closes.iloc[-10] * 100
+        if change_10 > 2:
+            bull_score += 1
+        elif change_10 < -2:
+            bear_score += 1
+    
+    # ─── القرار النهائي ───
+    score_diff = bull_score - bear_score
+    if score_diff >= 3:
+        bias = "BULLISH"
+        strength = min(10, 5 + score_diff)
+    elif score_diff >= 1:
+        bias = "WEAK_BULL"
+        strength = min(8, 4 + score_diff)
+    elif score_diff <= -3:
+        bias = "BEARISH"
+        strength = min(10, 5 + abs(score_diff))
+    elif score_diff <= -1:
+        bias = "WEAK_BEAR"
+        strength = min(8, 4 + abs(score_diff))
+    else:
+        bias = "NEUTRAL"
+        strength = 5
+    
+    return {
+        "bias": bias,
+        "strength": strength,
+        "ema_trend": ema_trend,
+        "structure": structure,
+        "rsi": round(rsi_now, 1),
+        "bull_score": bull_score,
+        "bear_score": bear_score,
+        "score": score_diff,
+    }
+
+
+def calculate_multi_tf_confluence(
+    df_daily: pd.DataFrame,
+    df_4h: pd.DataFrame,
+    df_1h: pd.DataFrame,
+    asset: str = "Gold",
+) -> Dict:
+    """يحلل التوافق بين 3 إطارات زمنية.
+    
+    المنطق:
+    - Daily: Long-term trend (الاتجاه الكبير)
+    - 4H: Mid-term momentum (الزخم المتوسط)
+    - 1H: Short-term timing (التوقيت الدقيق)
+    
+    Confluence = توافق الإطارات الثلاثة في نفس الاتجاه
+    
+    Returns: {
+        "daily": {bias, strength, ...},
+        "4h": {...},
+        "1h": {...},
+        "confluence_score": 0-10,
+        "confluence_direction": "BULLISH"/"BEARISH"/"MIXED",
+        "recommendation": str,
+        "agreement_count": int,
+    }
+    """
+    daily_analysis = analyze_timeframe_bias(df_daily)
+    h4_analysis = analyze_timeframe_bias(df_4h)
+    h1_analysis = analyze_timeframe_bias(df_1h)
+    
+    biases = [daily_analysis["bias"], h4_analysis["bias"], h1_analysis["bias"]]
+    
+    # تصنيف bullish/bearish
+    bullish_tfs = sum(1 for b in biases if "BULL" in b)
+    bearish_tfs = sum(1 for b in biases if "BEAR" in b)
+    
+    # توافق
+    if bullish_tfs == 3:
+        direction = "STRONG_BULLISH"
+        confluence = 10
+        agreement = 3
+        rec = (
+            "✅ *كل الإطارات صعودية — Strong Confluence!*\n"
+            "هذي الفرصة المثالية للـlong:\n"
+            "• Daily صعودي (الاتجاه الكبير)\n"
+            "• 4H صعودي (الزخم)\n"
+            "• 1H صعودي (التوقيت)\n\n"
+            "💡 BUY عند أي pullback لـSmart Money zones"
+        )
+    elif bearish_tfs == 3:
+        direction = "STRONG_BEARISH"
+        confluence = 10
+        agreement = 3
+        rec = (
+            "✅ *كل الإطارات هبوطية — Strong Confluence!*\n"
+            "هذي الفرصة المثالية للـshort:\n"
+            "• Daily هبوطي\n"
+            "• 4H هبوطي\n"
+            "• 1H هبوطي\n\n"
+            "💡 SELL عند أي rally لـResistance/OB"
+        )
+    elif bullish_tfs == 2:
+        direction = "BULLISH"
+        confluence = 7
+        agreement = 2
+        rec = (
+            "🟢 *إطاران صعوديان — Confluence جيد*\n"
+            "فرصة شراء لكن بحذر:\n"
+            "• تأكد إن الإطار اللي عكس مش هو Daily\n"
+            "• Position size أصغر (0.5x من الطبيعي)"
+        )
+    elif bearish_tfs == 2:
+        direction = "BEARISH"
+        confluence = 7
+        agreement = 2
+        rec = (
+            "🔴 *إطاران هبوطيان — Confluence جيد*\n"
+            "فرصة بيع لكن بحذر:\n"
+            "• تأكد إن الإطار اللي عكس مش هو Daily\n"
+            "• Position size أصغر"
+        )
+    elif bullish_tfs == 1 and bearish_tfs == 1:
+        direction = "MIXED"
+        confluence = 3
+        agreement = 0
+        rec = (
+            "⚠️ *إشارات متضاربة — تجنّب الدخول!*\n"
+            "Multi-TF غير متفقة:\n"
+            "• إطار صعودي + إطار هبوطي + إطار محايد\n"
+            "• *الانتظار أفضل* حتى يحصل توافق\n\n"
+            "💡 لو لازم تتداول، قلّل الـrisk لـ0.5%"
+        )
+    else:  # كلها neutral
+        direction = "NEUTRAL"
+        confluence = 5
+        agreement = 0
+        rec = (
+            "⚪ *كل الإطارات محايدة*\n"
+            "السوق في consolidation:\n"
+            "• انتظر اختراق واضح\n"
+            "• راقب الـliquidity pools\n"
+            "• استعد للحركة بعد الـbreakout"
+        )
+    
+    # تحقق من Daily override
+    # Daily هو الأهم - لو معاكس للاتنين الباقيين، Confluence ضعيف
+    daily_bias = daily_analysis["bias"]
+    if "BULL" in daily_bias and bearish_tfs == 2:
+        confluence = min(confluence, 4)
+        direction = "DAILY_BULL_CORRECTION"
+        rec = (
+            "⚠️ *Daily صعودي لكن 4H+1H هبوطيان*\n"
+            "هذا تصحيح في اتجاه صعودي:\n"
+            "• تجنّب الـSHORT (ضد الاتجاه الأكبر)\n"
+            "• انتظر pullback لـsmart money zones\n"
+            "• استعد للـLONG عند نهاية التصحيح"
+        )
+    elif "BEAR" in daily_bias and bullish_tfs == 2:
+        confluence = min(confluence, 4)
+        direction = "DAILY_BEAR_CORRECTION"
+        rec = (
+            "⚠️ *Daily هبوطي لكن 4H+1H صعوديان*\n"
+            "هذا rally في هبوط:\n"
+            "• تجنّب الـLONG (ضد الاتجاه الأكبر)\n"
+            "• انتظر تأكيد الانعكاس\n"
+            "• استعد للـSHORT عند نهاية الـrally"
+        )
+    
+    return {
+        "daily": daily_analysis,
+        "h4": h4_analysis,
+        "h1": h1_analysis,
+        "confluence_score": confluence,
+        "confluence_direction": direction,
+        "recommendation": rec,
+        "agreement_count": agreement,
+        "bullish_tfs": bullish_tfs,
+        "bearish_tfs": bearish_tfs,
+    }
+
+
+def format_multi_tf_analysis(mtf: Dict, asset: str = "Gold") -> str:
+    """تنسيق نتائج Multi-TF للعرض."""
+    if not mtf:
+        return "⚠️ تعذّر تحليل Multi-TF"
+    
+    daily = mtf["daily"]
+    h4 = mtf["h4"]
+    h1 = mtf["h1"]
+    confluence = mtf["confluence_score"]
+    
+    # Bias icon
+    bias_icon = {
+        "BULLISH": "🟢", "STRONG_BULLISH": "🟢⚡",
+        "WEAK_BULL": "🟢",
+        "BEARISH": "🔴", "STRONG_BEARISH": "🔴⚡",
+        "WEAK_BEAR": "🔴",
+        "NEUTRAL": "⚪",
+        "UNKNOWN": "❓",
+    }
+    
+    out = []
+    out.append("🎯 *MULTI-TIMEFRAME CONFLUENCE*")
+    out.append("═" * 33)
+    out.append(f"📊 *{asset}*")
+    out.append("")
+    
+    # ─── Daily ───
+    out.append(f"📅 *Daily (الاتجاه الكبير):*")
+    out.append(f"   {bias_icon.get(daily['bias'], '❓')} {daily['bias']} (قوة: {daily['strength']}/10)")
+    out.append(f"   📈 EMA: {daily['ema_trend']}")
+    out.append(f"   🏗 Structure: {daily['structure']}")
+    out.append(f"   📊 RSI: {daily['rsi']}")
+    out.append("")
+    
+    # ─── 4H ───
+    out.append(f"🕓 *4H (الزخم):*")
+    out.append(f"   {bias_icon.get(h4['bias'], '❓')} {h4['bias']} (قوة: {h4['strength']}/10)")
+    out.append(f"   📈 EMA: {h4['ema_trend']}")
+    out.append(f"   📊 RSI: {h4['rsi']}")
+    out.append("")
+    
+    # ─── 1H ───
+    out.append(f"🕐 *1H (التوقيت):*")
+    out.append(f"   {bias_icon.get(h1['bias'], '❓')} {h1['bias']} (قوة: {h1['strength']}/10)")
+    out.append(f"   📈 EMA: {h1['ema_trend']}")
+    out.append(f"   📊 RSI: {h1['rsi']}")
+    out.append("")
+    
+    # ─── Confluence Score ───
+    out.append("─" * 33)
+    score_bar = "█" * confluence + "░" * (10 - confluence)
+    out.append(f"🎯 *Confluence Score: {confluence}/10*")
+    out.append(f"   `{score_bar}`")
+    
+    # تقييم
+    if confluence >= 9:
+        rating = "🌟🌟🌟🌟🌟 توافق ممتاز"
+    elif confluence >= 7:
+        rating = "🌟🌟🌟🌟 توافق جيد"
+    elif confluence >= 5:
+        rating = "🌟🌟🌟 توافق متوسط"
+    elif confluence >= 3:
+        rating = "🌟🌟 توافق ضعيف"
+    else:
+        rating = "🌟 لا توافق"
+    out.append(f"   {rating}")
+    out.append("")
+    
+    # ─── التوصية ───
+    out.append("─" * 33)
+    out.append("💡 *التوصية:*")
+    out.append(mtf["recommendation"])
+    out.append("")
+    
+    out.append("⚠️ _تحليل تعليمي — ليس نصيحة استثمارية_")
+    
+    return "\n".join(out)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 3) LIQUIDITY MAP — كل المستويات في مكان واحد
 # ═══════════════════════════════════════════════════════════════════════
 def build_liquidity_map(
@@ -1835,3 +2191,431 @@ def parse_action_from_ai(text: str) -> Optional[str]:
     if "بيع" in text or "بيع" in text:
         return "SELL"
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 14) BACKTESTING ENGINE — اختبار الاستراتيجيات على البيانات التاريخية
+# ═══════════════════════════════════════════════════════════════════════
+def backtest_smart_risk_strategy(
+    df: pd.DataFrame,
+    asset: str = "Gold",
+    initial_capital: float = 4000,
+    risk_per_trade_pct: float = 1.5,
+    min_confluence: int = 6,
+) -> Dict:
+    """يختبر استراتيجية Smart Risk على بيانات تاريخية.
+    
+    الاستراتيجية:
+    1. كل 5 أيام (لتجنب overtrading) نتحقق من Multi-TF Confluence
+    2. لو في توافق ≥ min_confluence، نفتح صفقة
+    3. نستخدم Liquidity Pools لـSL/TP
+    4. Position size بناء على risk_per_trade_pct
+    5. نتابع كل شمعة - لو ضرب TP1/TP2/TP3/SL، نحسب النتيجة
+    
+    Returns: نتائج شاملة + قائمة بكل الصفقات
+    """
+    if df is None or df.empty or len(df) < 100:
+        return {"error": "Not enough data for backtest"}
+    
+    capital = initial_capital
+    trades = []
+    equity_curve = [(df.index[0], capital)]
+    open_trade = None
+    last_trade_close_idx = -10  # تجنب trading متتالي
+    
+    for i in range(50, len(df) - 1):
+        current_bar = df.iloc[i]
+        next_bar = df.iloc[i + 1] if i + 1 < len(df) else current_bar
+        
+        # ─── إدارة الصفقة المفتوحة ───
+        if open_trade:
+            high = float(next_bar["High"])
+            low = float(next_bar["Low"])
+            
+            is_buy = open_trade["action"] == "BUY"
+            sl = open_trade["sl"]
+            tp1 = open_trade["tp1"]
+            tp2 = open_trade["tp2"]
+            tp3 = open_trade["tp3"]
+            entry = open_trade["entry"]
+            risk = abs(entry - sl)
+            
+            exit_price = None
+            exit_reason = None
+            
+            if is_buy:
+                # check SL first (worst case)
+                if low <= sl:
+                    exit_price = sl
+                    exit_reason = "SL"
+                elif high >= tp3:
+                    exit_price = tp3
+                    exit_reason = "TP3"
+                elif high >= tp2:
+                    exit_price = tp2
+                    exit_reason = "TP2"
+                elif high >= tp1 and not open_trade.get("tp1_hit"):
+                    open_trade["tp1_hit"] = True
+                    open_trade["sl"] = entry  # move to BE
+            else:  # SELL
+                if high >= sl:
+                    exit_price = sl
+                    exit_reason = "SL"
+                elif low <= tp3:
+                    exit_price = tp3
+                    exit_reason = "TP3"
+                elif low <= tp2:
+                    exit_price = tp2
+                    exit_reason = "TP2"
+                elif low <= tp1 and not open_trade.get("tp1_hit"):
+                    open_trade["tp1_hit"] = True
+                    open_trade["sl"] = entry
+            
+            if exit_price:
+                # حساب PnL
+                if is_buy:
+                    pnl_pct = (exit_price - entry) / entry * 100
+                else:
+                    pnl_pct = (entry - exit_price) / entry * 100
+                
+                # Position size = risk_amount / (risk_per_unit)
+                risk_amount = capital * (risk_per_trade_pct / 100)
+                # حماية من قسمة على صفر
+                sl_pct = abs((sl - entry) / entry * 100) if entry > 0 else 0
+                if sl_pct == 0:
+                    # SL = Entry (مستحيل عملياً) - نتخطى
+                    open_trade = None
+                    continue
+                pnl_dollars = risk_amount * (pnl_pct / sl_pct)
+                if exit_reason == "SL":
+                    pnl_dollars = -risk_amount
+                
+                capital += pnl_dollars
+                
+                trades.append({
+                    "open_idx": open_trade["open_idx"],
+                    "close_idx": i + 1,
+                    "open_date": str(df.index[open_trade["open_idx"]])[:10],
+                    "close_date": str(df.index[i + 1])[:10],
+                    "asset": asset,
+                    "action": open_trade["action"],
+                    "entry": round(entry, 4),
+                    "exit": round(exit_price, 4),
+                    "sl": round(open_trade["sl_initial"], 4),
+                    "tp1": round(tp1, 4),
+                    "tp2": round(tp2, 4),
+                    "tp3": round(tp3, 4),
+                    "exit_reason": exit_reason,
+                    "pnl_pct": round(pnl_pct, 2),
+                    "pnl_dollars": round(pnl_dollars, 2),
+                    "capital_after": round(capital, 2),
+                    "tp1_was_hit": open_trade.get("tp1_hit", False),
+                })
+                
+                equity_curve.append((df.index[i + 1], capital))
+                last_trade_close_idx = i
+                open_trade = None
+                
+                # Stop if blown up
+                if capital < initial_capital * 0.5:
+                    break
+        
+        # ─── البحث عن صفقة جديدة ───
+        if not open_trade and (i - last_trade_close_idx) >= 5:
+            # نأخذ subset للـMulti-TF analysis
+            df_so_far = df.iloc[:i + 1]
+            
+            if len(df_so_far) < 100:
+                continue
+            
+            # Approximate 4H من Daily (تقريبي للـbacktest)
+            daily_subset = df_so_far.iloc[-min(60, len(df_so_far)):]
+            
+            # تحليل bias
+            try:
+                analysis = analyze_timeframe_bias(daily_subset)
+            except Exception:
+                continue
+            
+            bias = analysis["bias"]
+            strength = analysis["strength"]
+            
+            if bias == "STRONG_BULLISH" or (bias == "BULLISH" and strength >= 7):
+                # فرصة BUY
+                action = "BUY"
+            elif bias == "STRONG_BEARISH" or (bias == "BEARISH" and strength >= 7):
+                action = "SELL"
+            else:
+                continue
+            
+            # تحقق من Liquidity Pools
+            try:
+                liq_pools = find_liquidity_pools(df_so_far, asset)
+                sm_zones = find_smart_money_zones(df_so_far, asset)
+            except Exception:
+                continue
+            
+            entry = float(current_bar["Close"])
+            
+            # ATR لـSL
+            high_low = df_so_far["High"] - df_so_far["Low"]
+            high_close = (df_so_far["High"] - df_so_far["Close"].shift()).abs()
+            low_close = (df_so_far["Low"] - df_so_far["Close"].shift()).abs()
+            tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            atr = float(tr.rolling(14).mean().iloc[-1] or entry * 0.005)
+            
+            # ─── حساب SL/TP من liquidity pools ───
+            if action == "BUY":
+                # SL = خلف أقرب SSL pool
+                ssl_pools = [p for p in liq_pools.get("sell_side", [])
+                            if not p.get("is_swept") and p["distance_pct"] < 5]
+                if ssl_pools:
+                    nearest = min(ssl_pools, key=lambda x: x["distance_pct"])
+                    sl = nearest["price"] - atr * 0.5
+                else:
+                    sl = entry - atr * 1.5
+                
+                # TPs = نحو BSL pools
+                bsl_pools = [p for p in liq_pools.get("buy_side", [])
+                            if not p.get("is_swept") and p["distance_pct"] > 0.5]
+                bsl_pools.sort(key=lambda x: x["distance_pct"])
+                
+                if len(bsl_pools) >= 3:
+                    tp1 = bsl_pools[0]["price"]
+                    tp2 = bsl_pools[1]["price"]
+                    tp3 = bsl_pools[2]["price"]
+                else:
+                    risk = abs(entry - sl)
+                    tp1 = entry + risk * 1
+                    tp2 = entry + risk * 2
+                    tp3 = entry + risk * 3
+            
+            else:  # SELL
+                bsl_pools = [p for p in liq_pools.get("buy_side", [])
+                            if not p.get("is_swept") and p["distance_pct"] < 5]
+                if bsl_pools:
+                    nearest = min(bsl_pools, key=lambda x: x["distance_pct"])
+                    sl = nearest["price"] + atr * 0.5
+                else:
+                    sl = entry + atr * 1.5
+                
+                ssl_pools = [p for p in liq_pools.get("sell_side", [])
+                            if not p.get("is_swept") and p["distance_pct"] > 0.5]
+                ssl_pools.sort(key=lambda x: x["distance_pct"])
+                
+                if len(ssl_pools) >= 3:
+                    tp1 = ssl_pools[0]["price"]
+                    tp2 = ssl_pools[1]["price"]
+                    tp3 = ssl_pools[2]["price"]
+                else:
+                    risk = abs(entry - sl)
+                    tp1 = entry - risk * 1
+                    tp2 = entry - risk * 2
+                    tp3 = entry - risk * 3
+            
+            # تأكد إن TP في الاتجاه الصحيح
+            if action == "BUY":
+                if not (tp1 > entry and tp2 > entry and tp3 > entry):
+                    continue
+            else:
+                if not (tp1 < entry and tp2 < entry and tp3 < entry):
+                    continue
+            
+            # تأكد من R:R معقول
+            risk = abs(entry - sl)
+            if risk == 0:
+                continue
+            rr_to_tp1 = abs(tp1 - entry) / risk
+            if rr_to_tp1 < 0.5:  # too tight
+                continue
+            
+            open_trade = {
+                "open_idx": i,
+                "action": action,
+                "entry": entry,
+                "sl_initial": sl,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp3": tp3,
+                "tp1_hit": False,
+            }
+    
+    # ─── حساب الإحصاءات ───
+    if not trades:
+        return {
+            "asset": asset,
+            "period_days": (df.index[-1] - df.index[0]).days,
+            "total_trades": 0,
+            "error": "No trades generated by strategy",
+        }
+    
+    wins = [t for t in trades if t["pnl_dollars"] > 0]
+    losses = [t for t in trades if t["pnl_dollars"] < 0]
+    
+    win_rate = len(wins) / len(trades) * 100 if trades else 0
+    
+    # Profit Factor
+    gross_wins = sum(t["pnl_dollars"] for t in wins)
+    gross_losses = abs(sum(t["pnl_dollars"] for t in losses))
+    profit_factor = gross_wins / gross_losses if gross_losses > 0 else 0
+    
+    # Max Drawdown
+    peak = initial_capital
+    max_dd = 0
+    for ts, eq in equity_curve:
+        if eq > peak:
+            peak = eq
+        dd = (peak - eq) / peak * 100
+        if dd > max_dd:
+            max_dd = dd
+    
+    # Total Return
+    total_return = (capital - initial_capital) / initial_capital * 100
+    
+    # Average R:R
+    avg_rr = sum(abs(t["pnl_pct"]) for t in trades) / len(trades) if trades else 0
+    
+    # Sharpe (مبسط)
+    if len(trades) > 1:
+        returns = [t["pnl_pct"] for t in trades]
+        mean_r = sum(returns) / len(returns)
+        std_r = (sum((r - mean_r) ** 2 for r in returns) / len(returns)) ** 0.5
+        sharpe = (mean_r / std_r * (252 ** 0.5)) if std_r > 0 else 0
+    else:
+        sharpe = 0
+    
+    return {
+        "asset": asset,
+        "period_days": (df.index[-1] - df.index[0]).days,
+        "start_date": str(df.index[0])[:10],
+        "end_date": str(df.index[-1])[:10],
+        "initial_capital": initial_capital,
+        "final_capital": round(capital, 2),
+        "total_trades": len(trades),
+        "winning_trades": len(wins),
+        "losing_trades": len(losses),
+        "win_rate": round(win_rate, 1),
+        "avg_rr": round(avg_rr, 2),
+        "profit_factor": round(profit_factor, 2),
+        "max_drawdown_pct": round(max_dd, 2),
+        "total_return_pct": round(total_return, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "best_trade": max(trades, key=lambda t: t["pnl_dollars"]) if trades else None,
+        "worst_trade": min(trades, key=lambda t: t["pnl_dollars"]) if trades else None,
+        "trades": trades,
+    }
+
+
+def format_backtest_results(result: Dict) -> str:
+    """تنسيق نتائج الـbacktest للـTelegram."""
+    if result.get("error") and result.get("total_trades", 0) == 0:
+        return f"⚠️ *Backtest Failed*\n\n{result.get('error', '')}"
+    
+    out = []
+    out.append("📊 *BACKTEST RESULTS*")
+    out.append("═" * 33)
+    out.append(f"📈 الأصل: *{result['asset']}*")
+    out.append(f"📅 الفترة: {result['start_date']} → {result['end_date']}")
+    out.append(f"⏱ الأيام: {result['period_days']}")
+    out.append("")
+    
+    # ─── Capital ───
+    out.append("💰 *رأس المال:*")
+    out.append(f"   Initial: `${result['initial_capital']:,.0f}`")
+    final = result['final_capital']
+    icon = "🟢" if final >= result['initial_capital'] else "🔴"
+    out.append(f"   Final:   `${final:,.2f}` {icon}")
+    
+    total_ret = result['total_return_pct']
+    ret_icon = "🟢" if total_ret > 0 else "🔴"
+    out.append(f"   {ret_icon} العائد: *{total_ret:+.2f}%*")
+    out.append("")
+    
+    # ─── Performance ───
+    out.append("─" * 33)
+    out.append("📊 *الأداء:*")
+    out.append(f"   📋 إجمالي الصفقات: *{result['total_trades']}*")
+    out.append(f"   🟢 رابحة: {result['winning_trades']}")
+    out.append(f"   🔴 خاسرة: {result['losing_trades']}")
+    
+    wr = result['win_rate']
+    wr_icon = "🌟" if wr >= 60 else "✅" if wr >= 50 else "⚠️"
+    out.append(f"   {wr_icon} Win Rate: *{wr}%*")
+    out.append("")
+    
+    # ─── Risk Metrics ───
+    out.append("─" * 33)
+    out.append("⚖️ *مؤشرات المخاطر:*")
+    
+    pf = result['profit_factor']
+    pf_icon = "🌟" if pf >= 2 else "✅" if pf >= 1.5 else "⚠️" if pf >= 1 else "🔴"
+    out.append(f"   {pf_icon} Profit Factor: *{pf}*")
+    
+    dd = result['max_drawdown_pct']
+    dd_icon = "🟢" if dd < 5 else "🟡" if dd < 10 else "🔴"
+    out.append(f"   {dd_icon} Max Drawdown: *{dd}%*")
+    
+    sharpe = result['sharpe_ratio']
+    sh_icon = "🌟" if sharpe >= 2 else "✅" if sharpe >= 1 else "⚠️"
+    out.append(f"   {sh_icon} Sharpe Ratio: *{sharpe}*")
+    
+    out.append(f"   📐 Avg R:R: {result['avg_rr']}")
+    out.append("")
+    
+    # ─── Best/Worst ───
+    if result.get("best_trade") and result.get("worst_trade"):
+        best = result["best_trade"]
+        worst = result["worst_trade"]
+        out.append("─" * 33)
+        out.append("🏆 *أفضل صفقة:*")
+        out.append(f"   {best['open_date']} | {best['action']}")
+        out.append(f"   Entry: `{best['entry']}` → Exit: `{best['exit']}` ({best['exit_reason']})")
+        out.append(f"   💰 ربح: *{best['pnl_pct']:+.2f}%* (`${best['pnl_dollars']:+.2f}`)")
+        out.append("")
+        out.append("💔 *أسوأ صفقة:*")
+        out.append(f"   {worst['open_date']} | {worst['action']}")
+        out.append(f"   Entry: `{worst['entry']}` → Exit: `{worst['exit']}` ({worst['exit_reason']})")
+        out.append(f"   💸 خسارة: *{worst['pnl_pct']:+.2f}%* (`${worst['pnl_dollars']:+.2f}`)")
+        out.append("")
+    
+    # ─── التقييم النهائي ───
+    out.append("─" * 33)
+    out.append("🎯 *التقييم العام:*")
+    
+    score = 0
+    if wr >= 60: score += 3
+    elif wr >= 50: score += 2
+    elif wr >= 40: score += 1
+    
+    if pf >= 2: score += 3
+    elif pf >= 1.5: score += 2
+    elif pf >= 1: score += 1
+    
+    if dd < 5: score += 2
+    elif dd < 10: score += 1
+    
+    if sharpe >= 1.5: score += 2
+    elif sharpe >= 1: score += 1
+    
+    if score >= 8:
+        rating = "🌟🌟🌟🌟🌟 استراتيجية ممتازة"
+        verdict = "هذي استراتيجية احترافية - جاهزة للتطبيق"
+    elif score >= 6:
+        rating = "🌟🌟🌟🌟 استراتيجية جيدة جداً"
+        verdict = "أداء قوي - فعّلها بحذر"
+    elif score >= 4:
+        rating = "🌟🌟🌟 استراتيجية متوسطة"
+        verdict = "تحتاج تحسين - راجع الإعدادات"
+    else:
+        rating = "🌟 استراتيجية ضعيفة"
+        verdict = "❌ لا تستخدمها - أعد تصميم الاستراتيجية"
+    
+    out.append(rating)
+    out.append(f"_{verdict}_")
+    out.append("")
+    
+    out.append("⚠️ _Past performance ≠ future results_")
+    out.append("⚠️ _اختبار تعليمي — ليس ضمان للأرباح_")
+    
+    return "\n".join(out)

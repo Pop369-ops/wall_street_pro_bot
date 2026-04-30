@@ -254,10 +254,117 @@ def db_init():
         )
     """)
     
+    # ═══ جدول حماية الـDrawdown (داخل قواعد المستخدم) ═══
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS risk_protection (
+            chat_id TEXT PRIMARY KEY,
+            -- إعدادات المستخدم
+            max_daily_loss_pct REAL DEFAULT 5.0,        -- 5% خسارة يومية حد أقصى
+            max_weekly_loss_pct REAL DEFAULT 10.0,      -- 10% خسارة أسبوعية
+            max_consecutive_losses INTEGER DEFAULT 3,    -- 3 خسائر متتالية = إيقاف
+            max_open_trades INTEGER DEFAULT 5,           -- 5 صفقات مفتوحة كحد أقصى
+            max_total_risk_pct REAL DEFAULT 6.0,         -- 6% مخاطرة إجمالية مفتوحة
+            cooldown_hours INTEGER DEFAULT 24,           -- 24 ساعة بعد تفعيل الحماية
+            
+            -- الحالة الحالية
+            is_locked INTEGER DEFAULT 0,                 -- هل مفعّل القفل
+            lock_reason TEXT,                            -- سبب القفل
+            locked_until TEXT,                           -- متى ينتهي القفل
+            
+            -- إحصاءات اليوم/الأسبوع (تتحدث تلقائياً)
+            daily_pnl_pct REAL DEFAULT 0,
+            daily_pnl_dollars REAL DEFAULT 0,
+            weekly_pnl_pct REAL DEFAULT 0,
+            consecutive_losses INTEGER DEFAULT 0,
+            last_loss_at TEXT,
+            last_reset_day TEXT,
+            last_reset_week TEXT,
+            
+            -- enabled
+            enabled INTEGER DEFAULT 1,
+            updated_at TEXT
+        )
+    """)
+    
+    # ═══ جدول Trade Journal (دفتر التداول) ═══
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trade_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            trade_id INTEGER,                    -- ربط بـtracked_trades
+            
+            -- بيانات الصفقة
+            asset TEXT,
+            action TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            sl REAL,
+            tp_hit TEXT,                         -- TP1/TP2/TP3/SL/MANUAL
+            position_size REAL,
+            pnl_pct REAL,
+            pnl_dollars REAL,
+            
+            -- السياق
+            session TEXT,                        -- Asian/European/American
+            day_of_week TEXT,                    -- Monday/Tuesday/...
+            duration_hours REAL,                 -- مدة الصفقة بالساعات
+            confluence_score REAL,               -- multi-tf confluence
+            confidence_score REAL,               -- AI confidence
+            setup_type TEXT,                     -- Liquidity Sweep / OB / FVG / ...
+            
+            -- نتائج
+            outcome TEXT,                        -- WIN / LOSS / BREAKEVEN
+            risk_reward REAL,                    -- 1:2.5 → 2.5
+            
+            -- التاريخ
+            opened_at TEXT,
+            closed_at TEXT,
+            
+            -- ملاحظات يدوية اختيارية
+            user_notes TEXT,
+            FOREIGN KEY (trade_id) REFERENCES tracked_trades(id)
+        )
+    """)
+    
+    # ═══ جدول Backtests Results ═══
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            asset TEXT,
+            strategy TEXT,                       -- 'smart_risk' / 'scalping' / 'multi_tf'
+            
+            -- إعدادات الاختبار
+            period_days INTEGER,
+            start_date TEXT,
+            end_date TEXT,
+            initial_capital REAL,
+            
+            -- نتائج
+            total_trades INTEGER,
+            winning_trades INTEGER,
+            losing_trades INTEGER,
+            win_rate REAL,
+            avg_rr REAL,
+            profit_factor REAL,
+            max_drawdown_pct REAL,
+            total_return_pct REAL,
+            sharpe_ratio REAL,
+            
+            -- التفاصيل (JSON)
+            trades_json TEXT,
+            equity_curve_json TEXT,
+            
+            run_at TEXT
+        )
+    """)
+    
     c.execute("CREATE INDEX IF NOT EXISTS idx_tracked_chat ON tracked_trades(chat_id, status)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_tracked_status ON tracked_trades(status)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_trade ON trade_alerts_sent(trade_id, alert_type)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_news_alerts_chat ON news_alerts_sent(chat_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_journal_chat ON trade_journal(chat_id, closed_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_backtest_chat ON backtest_results(chat_id, run_at)")
     
     conn.commit()
     conn.close()
@@ -499,6 +606,380 @@ def news_alert_mark_sent(chat_id: str, news_id: str):
         )
     except Exception:
         pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1.7) RISK PROTECTION — حماية الحساب من الكوارث
+# ═══════════════════════════════════════════════════════════════════════
+def risk_protection_get(chat_id: str) -> Dict:
+    """يجلب إعدادات حماية المخاطر (مع defaults)."""
+    row = db_exec(
+        "SELECT * FROM risk_protection WHERE chat_id=?",
+        (chat_id,), fetch="one"
+    )
+    if row:
+        return dict(row)
+    # Defaults
+    now = datetime.now(timezone.utc).isoformat()
+    db_exec(
+        """INSERT INTO risk_protection (chat_id, updated_at, last_reset_day, last_reset_week)
+           VALUES (?, ?, ?, ?)""",
+        (chat_id, now, now[:10], now[:10])
+    )
+    return {
+        "chat_id": chat_id,
+        "max_daily_loss_pct": 5.0,
+        "max_weekly_loss_pct": 10.0,
+        "max_consecutive_losses": 3,
+        "max_open_trades": 5,
+        "max_total_risk_pct": 6.0,
+        "cooldown_hours": 24,
+        "is_locked": 0,
+        "lock_reason": None,
+        "locked_until": None,
+        "daily_pnl_pct": 0,
+        "daily_pnl_dollars": 0,
+        "weekly_pnl_pct": 0,
+        "consecutive_losses": 0,
+        "enabled": 1,
+    }
+
+
+def risk_protection_update(chat_id: str, **kwargs) -> bool:
+    """يحدّث إعدادات الحماية."""
+    if not kwargs:
+        return False
+    risk_protection_get(chat_id)  # ensure row exists
+    set_clause = ", ".join(f"{k}=?" for k in kwargs)
+    values = list(kwargs.values()) + [datetime.now(timezone.utc).isoformat(), chat_id]
+    db_exec(
+        f"UPDATE risk_protection SET {set_clause}, updated_at=? WHERE chat_id=?",
+        tuple(values)
+    )
+    return True
+
+
+def risk_protection_reset_daily(chat_id: str):
+    """إعادة تعيين الإحصاءات اليومية (يُستدعى تلقائياً)."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    settings = risk_protection_get(chat_id)
+    if settings.get("last_reset_day") != today:
+        risk_protection_update(
+            chat_id,
+            daily_pnl_pct=0,
+            daily_pnl_dollars=0,
+            last_reset_day=today,
+        )
+
+
+def risk_protection_reset_weekly(chat_id: str):
+    """إعادة تعيين الأسبوع (يوم الإثنين)."""
+    now = datetime.now(timezone.utc)
+    monday = now - timedelta(days=now.weekday())
+    monday_str = monday.strftime("%Y-%m-%d")
+    settings = risk_protection_get(chat_id)
+    if settings.get("last_reset_week") != monday_str:
+        risk_protection_update(
+            chat_id,
+            weekly_pnl_pct=0,
+            consecutive_losses=0,
+            last_reset_week=monday_str,
+        )
+
+
+def risk_protection_check_lock(chat_id: str) -> Tuple[bool, Optional[str]]:
+    """يتحقق هل المستخدم في حالة قفل (Cooldown).
+    
+    Returns: (is_locked, reason_if_locked)
+    """
+    settings = risk_protection_get(chat_id)
+    if not settings.get("enabled"):
+        return False, None
+    
+    # تحقق من انتهاء فترة القفل
+    if settings.get("is_locked") and settings.get("locked_until"):
+        try:
+            until = datetime.fromisoformat(settings["locked_until"])
+            now = datetime.now(timezone.utc)
+            if now < until:
+                hrs_left = (until - now).total_seconds() / 3600
+                return True, (
+                    f"🔒 *حسابك في وضع الحماية (Cooldown)*\n\n"
+                    f"السبب: {settings.get('lock_reason', 'مخاطرة عالية')}\n"
+                    f"⏰ يفتح بعد: {hrs_left:.1f} ساعة\n\n"
+                    f"💡 *استخدم الوقت لـ:*\n"
+                    f"• مراجعة الصفقات السابقة\n"
+                    f"• قراءة الأسواق بدون ضغط\n"
+                    f"• اختبار الأفكار على الـbacktest\n\n"
+                    f"_للإلغاء يدوياً: `الغاء_حماية`_"
+                )
+            else:
+                # انتهى - فُكّ القفل
+                risk_protection_update(
+                    chat_id,
+                    is_locked=0,
+                    lock_reason=None,
+                    locked_until=None,
+                )
+        except Exception:
+            pass
+    
+    return False, None
+
+
+def risk_protection_record_trade_close(
+    chat_id: str,
+    pnl_pct: float,
+    pnl_dollars: float,
+):
+    """يسجّل إغلاق صفقة ويتحقق من الحدود."""
+    risk_protection_reset_daily(chat_id)
+    risk_protection_reset_weekly(chat_id)
+    settings = risk_protection_get(chat_id)
+    
+    if not settings.get("enabled"):
+        return
+    
+    # تحديث الإحصاءات
+    new_daily_pct = settings.get("daily_pnl_pct", 0) + pnl_pct
+    new_daily_dollars = settings.get("daily_pnl_dollars", 0) + pnl_dollars
+    new_weekly_pct = settings.get("weekly_pnl_pct", 0) + pnl_pct
+    
+    # تحديث consecutive losses
+    if pnl_pct < 0:
+        new_consecutive = settings.get("consecutive_losses", 0) + 1
+    else:
+        new_consecutive = 0  # reset on win
+    
+    risk_protection_update(
+        chat_id,
+        daily_pnl_pct=new_daily_pct,
+        daily_pnl_dollars=new_daily_dollars,
+        weekly_pnl_pct=new_weekly_pct,
+        consecutive_losses=new_consecutive,
+        last_loss_at=datetime.now(timezone.utc).isoformat() if pnl_pct < 0 else settings.get("last_loss_at"),
+    )
+    
+    # ─── فحص الحدود وتفعيل القفل ───
+    lock_reason = None
+    
+    # 1) حد الخسارة اليومية
+    if new_daily_pct <= -settings.get("max_daily_loss_pct", 5.0):
+        lock_reason = f"⛔ تجاوز حد الخسارة اليومية ({new_daily_pct:.2f}% / -{settings['max_daily_loss_pct']}%)"
+    
+    # 2) حد الخسارة الأسبوعية
+    elif new_weekly_pct <= -settings.get("max_weekly_loss_pct", 10.0):
+        lock_reason = f"⛔ تجاوز حد الخسارة الأسبوعية ({new_weekly_pct:.2f}% / -{settings['max_weekly_loss_pct']}%)"
+    
+    # 3) خسائر متتالية
+    elif new_consecutive >= settings.get("max_consecutive_losses", 3):
+        lock_reason = f"⛔ {new_consecutive} خسائر متتالية — استراحة إجبارية"
+    
+    if lock_reason:
+        cooldown_hrs = settings.get("cooldown_hours", 24)
+        until = datetime.now(timezone.utc) + timedelta(hours=cooldown_hrs)
+        risk_protection_update(
+            chat_id,
+            is_locked=1,
+            lock_reason=lock_reason,
+            locked_until=until.isoformat(),
+        )
+        return lock_reason
+    
+    return None
+
+
+def risk_protection_check_new_trade(chat_id: str, asset: str, position_size: float = 0.01) -> Tuple[bool, Optional[str]]:
+    """يتحقق قبل فتح صفقة جديدة هل المستخدم متعدّي الحدود.
+    
+    Returns: (is_allowed, warning_if_not)
+    """
+    settings = risk_protection_get(chat_id)
+    if not settings.get("enabled"):
+        return True, None
+    
+    # 1) تحقق من القفل
+    is_locked, lock_msg = risk_protection_check_lock(chat_id)
+    if is_locked:
+        return False, lock_msg
+    
+    # 2) تحقق من عدد الصفقات المفتوحة
+    active = track_get_active_trades(chat_id)
+    max_open = settings.get("max_open_trades", 5)
+    if len(active) >= max_open:
+        return False, (
+            f"⚠️ *وصلت لحد الصفقات المفتوحة ({max_open})*\n\n"
+            f"عندك {len(active)} صفقة نشطة بالفعل.\n"
+            f"اقفل صفقة قبل ما تفتح جديدة.\n\n"
+            f"اكتب `صفقاتي` لمراجعتهم."
+        )
+    
+    # 3) تحذير لو في صفقة على نفس الأصل
+    same_asset = [t for t in active if t["asset"] == asset]
+    if same_asset:
+        return True, (
+            f"⚠️ *تنبيه: عندك صفقة نشطة على {asset}*\n"
+            f"(Trade #{same_asset[0]['id']}) — تأكد من فهم المخاطرة المضاعفة"
+        )
+    
+    return True, None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1.8) TRADE JOURNAL — دفتر التداول
+# ═══════════════════════════════════════════════════════════════════════
+def journal_record_closed_trade(
+    chat_id: str,
+    trade: Dict,
+    confluence_score: float = None,
+    confidence_score: float = None,
+    setup_type: str = None,
+):
+    """يسجّل صفقة مغلقة في الجورنال."""
+    try:
+        # حساب السياق
+        opened = datetime.fromisoformat(trade.get("opened_at", "").replace("Z", "+00:00"))
+        closed = datetime.fromisoformat(trade.get("closed_at", "").replace("Z", "+00:00"))
+        duration_hrs = (closed - opened).total_seconds() / 3600
+        
+        # الجلسة (تقريبي)
+        opened_hour = opened.hour
+        if 0 <= opened_hour < 8:
+            session = "Asian"
+        elif 8 <= opened_hour < 13:
+            session = "European"
+        else:
+            session = "American"
+        
+        day_of_week = opened.strftime("%A")
+        
+        # النتيجة
+        pnl_pct = trade.get("pnl_pct", 0) or 0
+        if pnl_pct > 0.5:
+            outcome = "WIN"
+        elif pnl_pct < -0.5:
+            outcome = "LOSS"
+        else:
+            outcome = "BREAKEVEN"
+        
+        # R:R
+        sl = trade.get("sl") or 0
+        entry = trade.get("entry_price") or 0
+        exit_p = trade.get("exit_price") or 0
+        risk = abs(entry - sl) if sl else 1
+        reward = abs(exit_p - entry) if exit_p else 0
+        rr = round(reward / risk, 2) if risk > 0 else 0
+        
+        db_exec(
+            """INSERT INTO trade_journal 
+               (chat_id, trade_id, asset, action, entry_price, exit_price,
+                sl, tp_hit, position_size, pnl_pct, pnl_dollars,
+                session, day_of_week, duration_hours,
+                confluence_score, confidence_score, setup_type,
+                outcome, risk_reward, opened_at, closed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (chat_id, trade.get("id"), trade.get("asset"), trade.get("action"),
+             entry, exit_p, sl, trade.get("exit_reason"),
+             trade.get("position_size"), pnl_pct, trade.get("pnl_dollars"),
+             session, day_of_week, round(duration_hrs, 2),
+             confluence_score, confidence_score, setup_type,
+             outcome, rr,
+             trade.get("opened_at"), trade.get("closed_at"))
+        )
+    except Exception as e:
+        log.warning(f"journal record: {e}")
+
+
+def journal_get_stats(chat_id: str, days: int = 30) -> Dict:
+    """إحصائيات شاملة من الجورنال."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    rows = db_exec(
+        "SELECT * FROM trade_journal WHERE chat_id=? AND closed_at >= ?",
+        (chat_id, cutoff), fetch="all"
+    )
+    if not rows:
+        return {"total": 0}
+    
+    trades = [dict(r) for r in rows]
+    
+    # إحصاءات أساسية
+    total = len(trades)
+    wins = [t for t in trades if t.get("outcome") == "WIN"]
+    losses = [t for t in trades if t.get("outcome") == "LOSS"]
+    win_rate = len(wins) / total * 100 if total > 0 else 0
+    
+    total_pnl_pct = sum(t.get("pnl_pct", 0) or 0 for t in trades)
+    total_pnl_dollars = sum(t.get("pnl_dollars", 0) or 0 for t in trades)
+    avg_win_pct = (sum(t.get("pnl_pct", 0) or 0 for t in wins) / len(wins)) if wins else 0
+    avg_loss_pct = (sum(t.get("pnl_pct", 0) or 0 for t in losses) / len(losses)) if losses else 0
+    
+    # Profit Factor
+    gross_wins = sum(t.get("pnl_dollars", 0) or 0 for t in wins)
+    gross_losses = abs(sum(t.get("pnl_dollars", 0) or 0 for t in losses))
+    profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else 0
+    
+    # By asset
+    by_asset = {}
+    for t in trades:
+        a = t.get("asset", "?")
+        if a not in by_asset:
+            by_asset[a] = {"count": 0, "wins": 0, "pnl": 0}
+        by_asset[a]["count"] += 1
+        if t.get("outcome") == "WIN":
+            by_asset[a]["wins"] += 1
+        by_asset[a]["pnl"] += t.get("pnl_dollars", 0) or 0
+    
+    # By session
+    by_session = {"Asian": {"count": 0, "wins": 0, "pnl": 0},
+                  "European": {"count": 0, "wins": 0, "pnl": 0},
+                  "American": {"count": 0, "wins": 0, "pnl": 0}}
+    for t in trades:
+        s = t.get("session", "?")
+        if s in by_session:
+            by_session[s]["count"] += 1
+            if t.get("outcome") == "WIN":
+                by_session[s]["wins"] += 1
+            by_session[s]["pnl"] += t.get("pnl_dollars", 0) or 0
+    
+    # Best/Worst
+    best_trade = max(trades, key=lambda t: t.get("pnl_pct", 0) or 0)
+    worst_trade = min(trades, key=lambda t: t.get("pnl_pct", 0) or 0)
+    
+    # Avg R:R
+    rrs = [t.get("risk_reward", 0) for t in trades if t.get("risk_reward")]
+    avg_rr = sum(rrs) / len(rrs) if rrs else 0
+    
+    # Avg duration
+    durations = [t.get("duration_hours", 0) for t in trades if t.get("duration_hours")]
+    avg_duration = sum(durations) / len(durations) if durations else 0
+    
+    # Sharpe Ratio (simplified)
+    if len(trades) > 5:
+        returns = [t.get("pnl_pct", 0) or 0 for t in trades]
+        mean_return = sum(returns) / len(returns)
+        std_return = (sum((r - mean_return) ** 2 for r in returns) / len(returns)) ** 0.5
+        sharpe = (mean_return / std_return * (252 ** 0.5)) if std_return > 0 else 0
+    else:
+        sharpe = 0
+    
+    return {
+        "total": total,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(win_rate, 1),
+        "total_pnl_pct": round(total_pnl_pct, 2),
+        "total_pnl_dollars": round(total_pnl_dollars, 2),
+        "avg_win_pct": round(avg_win_pct, 2),
+        "avg_loss_pct": round(avg_loss_pct, 2),
+        "profit_factor": round(profit_factor, 2),
+        "avg_rr": round(avg_rr, 2),
+        "avg_duration_hrs": round(avg_duration, 1),
+        "sharpe_ratio": round(sharpe, 2),
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "by_asset": by_asset,
+        "by_session": by_session,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -3247,6 +3728,14 @@ async def trade_check_single(trade: Dict, send_alert: bool = True, bot=None) -> 
             should_close = True
             if send_alert and bot:
                 track_close_trade(trade["id"], current_price, "SL", pnl_d, pnl_p)
+                # تسجيل في الجورنال + Risk check
+                try:
+                    updated = track_get_trade(trade["id"])
+                    if updated:
+                        journal_record_closed_trade(trade["chat_id"], updated)
+                    risk_protection_record_trade_close(trade["chat_id"], pnl_p, pnl_d)
+                except Exception:
+                    pass
     
     # ─── 2. فحص TP3 (الأهم - إغلاق كامل) ───
     if not should_close and tp3 and not trade.get("tp3_hit"):
@@ -3268,6 +3757,14 @@ async def trade_check_single(trade: Dict, send_alert: bool = True, bot=None) -> 
             should_close = True
             if send_alert and bot:
                 track_close_trade(trade["id"], current_price, "TP3", pnl_d, pnl_p)
+                # تسجيل في الجورنال + Risk check
+                try:
+                    updated = track_get_trade(trade["id"])
+                    if updated:
+                        journal_record_closed_trade(trade["chat_id"], updated)
+                    risk_protection_record_trade_close(trade["chat_id"], pnl_p, pnl_d)
+                except Exception:
+                    pass
     
     # ─── 3. فحص TP2 ───
     if not should_close and tp2 and not trade.get("tp2_hit"):
@@ -3786,6 +4283,29 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "  ▸ خبر عاجل + تحليل AI فوري\n"
         "  ▸ تأثير على الأصول + توصية\n"
         "  ▸ مستويات حرجة للمراقبة\n\n"
+        "🛡️ *Risk Protection* ✨ جديد:\n"
+        "`حماية` — عرض الإعدادات والإحصاءات\n"
+        "`حد_يومي [N]` — تعديل حد الخسارة اليومي\n"
+        "`حد_صفقات [N]` — تعديل عدد الصفقات\n"
+        "`الغاء_حماية` — فك القفل (لو مفعّل)\n"
+        "  ▸ يوقف التداول بعد كوارث محددة\n"
+        "  ▸ Cooldown 24 ساعة عند كسر الحد\n\n"
+        "🎯 *Multi-TF Confluence* ✨ جديد:\n"
+        "`multitf ذهب` — تحليل Daily+4H+1H\n"
+        "`توافق eurusd` — Confluence Score 10\n"
+        "  ▸ يكشف الـsetups القوية الحقيقية\n"
+        "  ▸ يحذّرك من الإشارات المتضاربة\n\n"
+        "📊 *Trade Journal* ✨ جديد:\n"
+        "`جورنال` — تقرير أداء 30 يوم\n"
+        "  ▸ Win Rate + Profit Factor + Sharpe\n"
+        "  ▸ تحليل بالأصل والجلسة\n"
+        "  ▸ نصائح تحسين شخصية\n\n"
+        "🏆 *Backtesting* ✨ جديد:\n"
+        "`backtest ذهب 90` — اختبار 90 يوم\n"
+        "`backtest eurusd 365` — سنة كاملة\n"
+        "  ▸ يثبت إن الاستراتيجية شغّالة\n"
+        "  ▸ Win Rate + Drawdown + Sharpe\n"
+        "  ▸ تقييم 5/5 نجوم\n\n"
         "📊 *التحليل العميق:*\n"
         "`تحليل` — تحليل سوق شامل\n"
         "`فني` — التحليل الفني (RSI/MACD/EMA/BB/ICT)\n"
@@ -3985,6 +4505,15 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
+            # ─── فحص Risk Protection قبل التتبع ───
+            allowed, warning = risk_protection_check_new_trade(chat_id, asset, position_size)
+            if not allowed:
+                await u.message.reply_text(warning, parse_mode="Markdown")
+                return
+            elif warning:
+                # تحذير لكن مسموح
+                await u.message.reply_text(warning, parse_mode="Markdown")
+            
             # ─── إنشاء التتبع ───
             trade_id = track_create_trade(
                 chat_id=chat_id,
@@ -4025,6 +4554,434 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # 🏆 BACKTEST — اختبار الاستراتيجية على البيانات التاريخية
+    # ═══════════════════════════════════════════════════════════════════
+    if text.startswith(("backtest", "بكتست", "اختبار", "بكتيست")):
+        parts = text.split()
+        # الأصل
+        asset_input = parts[1].lower() if len(parts) >= 2 else "ذهب"
+        period_days = int(parts[2]) if len(parts) >= 3 else 90
+        
+        asset_map = {
+            "ذهب": ("Gold", "GC=F", "XAU/USD"),
+            "gold": ("Gold", "GC=F", "XAU/USD"),
+            "فضة": ("Silver", "SI=F", "XAG/USD"),
+            "silver": ("Silver", "SI=F", "XAG/USD"),
+            "eurusd": ("EUR/USD", "EURUSD=X", "EUR/USD"),
+            "gbpusd": ("GBP/USD", "GBPUSD=X", "GBP/USD"),
+            "usdjpy": ("USD/JPY", "JPY=X", "USD/JPY"),
+            "audusd": ("AUD/USD", "AUDUSD=X", "AUD/USD"),
+            "بترول": ("Oil", "CL=F", "WTI"),
+            "oil": ("Oil", "CL=F", "WTI"),
+        }
+        info = asset_map.get(asset_input)
+        if not info:
+            await u.message.reply_text(
+                "⚠️ *Backtest*\n\n"
+                "الصيغة: `backtest [أصل] [أيام]`\n\n"
+                "*أمثلة:*\n"
+                "• `backtest ذهب 90`\n"
+                "• `backtest eurusd 180`\n"
+                "• `backtest gold 365`\n\n"
+                "*الأصول:* ذهب / فضة / eurusd / gbpusd / usdjpy / audusd / بترول",
+                parse_mode="Markdown"
+            )
+            return
+        
+        asset, yf_ticker, poly_key = info
+        period_str = f"{period_days}d" if period_days <= 365 else f"{period_days // 365}y"
+        if period_days > 720:
+            period_str = "2y"
+        elif period_days > 365:
+            period_str = "2y"
+        elif period_days > 180:
+            period_str = "1y"
+        elif period_days > 90:
+            period_str = "6mo"
+        else:
+            period_str = "3mo"
+        
+        await u.message.reply_text(
+            f"🏆 *Backtest قيد التشغيل...*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 الأصل: {asset}\n"
+            f"📅 الفترة: {period_days} يوم\n"
+            f"⚙️ الاستراتيجية: Smart Risk + Liquidity Pools\n"
+            f"💰 رأس المال: $4,000\n"
+            f"⚖️ Risk: 1.5% per trade\n\n"
+            f"_⏳ يستغرق 20-60 ثانية..._",
+            parse_mode="Markdown"
+        )
+        
+        try:
+            # جلب البيانات
+            if poly_key:
+                df, _ = get_asset_dataframe_scaled(poly_key, yf_ticker, period_str, "1d")
+                if df is None or df.empty:
+                    t = yf.Ticker(yf_ticker)
+                    df = t.history(period=period_str, interval="1d")
+            else:
+                t = yf.Ticker(yf_ticker)
+                df = t.history(period=period_str, interval="1d")
+            
+            if df is None or df.empty:
+                await u.message.reply_text("⚠️ تعذّر جلب البيانات التاريخية")
+                return
+            
+            # تشغيل backtest
+            result = smart_risk.backtest_smart_risk_strategy(
+                df=df,
+                asset=asset,
+                initial_capital=4000,
+                risk_per_trade_pct=1.5,
+            )
+            
+            # حفظ في DB
+            try:
+                db_exec(
+                    """INSERT INTO backtest_results 
+                       (chat_id, asset, strategy, period_days, start_date, end_date,
+                        initial_capital, total_trades, winning_trades, losing_trades,
+                        win_rate, avg_rr, profit_factor, max_drawdown_pct,
+                        total_return_pct, sharpe_ratio, run_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (chat_id, asset, "smart_risk", period_days,
+                     result.get("start_date"), result.get("end_date"),
+                     4000, result.get("total_trades", 0),
+                     result.get("winning_trades", 0), result.get("losing_trades", 0),
+                     result.get("win_rate", 0), result.get("avg_rr", 0),
+                     result.get("profit_factor", 0), result.get("max_drawdown_pct", 0),
+                     result.get("total_return_pct", 0), result.get("sharpe_ratio", 0),
+                     datetime.now(timezone.utc).isoformat())
+                )
+            except Exception:
+                pass
+            
+            text_out = smart_risk.format_backtest_results(result)
+            await send_long(u, text_out)
+        except Exception as e:
+            log.warning(f"Backtest error: {e}")
+            await u.message.reply_text(f"⚠️ خطأ في الـbacktest: {str(e)[:100]}")
+        return
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # 🎯 MULTI-TF CONFLUENCE — تحليل 3 إطارات زمنية
+    # ═══════════════════════════════════════════════════════════════════
+    if text.startswith(("multitf", "متعدد", "اطارات", "إطارات", "confluence", "توافق")):
+        parts = text.split()
+        asset_input = parts[1].lower() if len(parts) >= 2 else "ذهب"
+        
+        asset_map = {
+            "ذهب": ("Gold", "GC=F", "XAU/USD"),
+            "gold": ("Gold", "GC=F", "XAU/USD"),
+            "فضة": ("Silver", "SI=F", "XAG/USD"),
+            "silver": ("Silver", "SI=F", "XAG/USD"),
+            "eurusd": ("EUR/USD", "EURUSD=X", "EUR/USD"),
+            "gbpusd": ("GBP/USD", "GBPUSD=X", "GBP/USD"),
+            "usdjpy": ("USD/JPY", "JPY=X", "USD/JPY"),
+            "audusd": ("AUD/USD", "AUDUSD=X", "AUD/USD"),
+            "بترول": ("Oil", "CL=F", "WTI"),
+            "oil": ("Oil", "CL=F", "WTI"),
+        }
+        info = asset_map.get(asset_input)
+        if not info:
+            await u.message.reply_text(
+                "🎯 *Multi-Timeframe Confluence*\n\n"
+                "الصيغة: `multitf [أصل]` أو `توافق [أصل]`\n\n"
+                "*أمثلة:*\n"
+                "• `multitf ذهب`\n"
+                "• `توافق eurusd`\n\n"
+                "📊 يحلل Daily + 4H + 1H ويعطي Confluence Score من 10",
+                parse_mode="Markdown"
+            )
+            return
+        
+        asset, yf_ticker, poly_key = info
+        
+        await u.message.reply_text(
+            f"🎯 *Multi-TF Analysis — {asset}*\n_جاري تحليل 3 إطارات زمنية..._",
+            parse_mode="Markdown"
+        )
+        
+        try:
+            # جلب 3 إطارات
+            if poly_key:
+                df_daily, _ = get_asset_dataframe_scaled(poly_key, yf_ticker, "6mo", "1d")
+                df_4h, _ = get_asset_dataframe_scaled(poly_key, yf_ticker, "60d", "1h")
+                df_1h, _ = get_asset_dataframe_scaled(poly_key, yf_ticker, "30d", "1h")
+            else:
+                t = yf.Ticker(yf_ticker)
+                df_daily = t.history(period="6mo", interval="1d")
+                df_4h = t.history(period="60d", interval="1h")
+                df_1h = t.history(period="30d", interval="1h")
+            
+            if df_daily is None or df_daily.empty:
+                await u.message.reply_text("⚠️ تعذّر جلب البيانات")
+                return
+            
+            # تحليل Multi-TF
+            mtf = smart_risk.calculate_multi_tf_confluence(
+                df_daily=df_daily,
+                df_4h=df_4h if df_4h is not None else df_daily,
+                df_1h=df_1h if df_1h is not None else df_daily,
+                asset=asset,
+            )
+            
+            text_out = smart_risk.format_multi_tf_analysis(mtf, asset)
+            await send_long(u, text_out)
+        except Exception as e:
+            log.warning(f"MultiTF error: {e}")
+            await u.message.reply_text(f"⚠️ خطأ: {str(e)[:100]}")
+        return
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # 📊 TRADE JOURNAL — إحصاءات شاملة
+    # ═══════════════════════════════════════════════════════════════════
+    if text in ("جورنال", "journal", "احصاءات", "إحصاءات", "stats", "تقرير_تداول"):
+        await u.message.reply_text(
+            "📊 *جاري تحضير تقرير التداول...*",
+            parse_mode="Markdown"
+        )
+        
+        try:
+            stats = journal_get_stats(chat_id, days=30)
+            
+            if stats["total"] == 0:
+                await u.message.reply_text(
+                    "📭 *لا توجد بيانات في الجورنال*\n\n"
+                    "أكمل بعض الصفقات أولاً (TP أو SL أو إغلاق يدوي)\n"
+                    "ثم استخدم `جورنال` للتقرير الشامل.",
+                    parse_mode="Markdown"
+                )
+                return
+            
+            msg = "📊 *Trade Journal — آخر 30 يوم*\n"
+            msg += "═══════════════════════════\n\n"
+            
+            # ─── النظرة العامة ───
+            msg += "🎯 *النظرة العامة:*\n"
+            msg += f"   • إجمالي الصفقات: *{stats['total']}*\n"
+            msg += f"   • 🟢 رابحة: {stats['wins']}\n"
+            msg += f"   • 🔴 خاسرة: {stats['losses']}\n"
+            
+            wr = stats['win_rate']
+            wr_icon = "🌟" if wr >= 60 else "✅" if wr >= 50 else "⚠️"
+            msg += f"   • {wr_icon} Win Rate: *{wr}%*\n\n"
+            
+            # ─── الأرباح ───
+            msg += "💰 *الأرباح:*\n"
+            total_d = stats['total_pnl_dollars']
+            total_pct = stats['total_pnl_pct']
+            icon_d = "🟢" if total_d > 0 else "🔴"
+            msg += f"   • Total PnL: {icon_d} `${total_d:+,.2f}` ({total_pct:+.2f}%)\n"
+            msg += f"   • متوسط الربح: `{stats['avg_win_pct']:+.2f}%`\n"
+            msg += f"   • متوسط الخسارة: `{stats['avg_loss_pct']:+.2f}%`\n\n"
+            
+            # ─── المؤشرات الاحترافية ───
+            msg += "⚖️ *المؤشرات:*\n"
+            
+            pf = stats['profit_factor']
+            pf_icon = "🌟" if pf >= 2 else "✅" if pf >= 1.5 else "⚠️" if pf >= 1 else "🔴"
+            msg += f"   • {pf_icon} Profit Factor: *{pf}*\n"
+            
+            sh = stats['sharpe_ratio']
+            sh_icon = "🌟" if sh >= 2 else "✅" if sh >= 1 else "⚠️"
+            msg += f"   • {sh_icon} Sharpe Ratio: *{sh}*\n"
+            
+            msg += f"   • 📐 متوسط R:R: *{stats['avg_rr']}*\n"
+            msg += f"   • ⏱ متوسط المدة: {stats['avg_duration_hrs']} ساعة\n\n"
+            
+            # ─── حسب الأصل ───
+            if stats.get("by_asset"):
+                msg += "📈 *حسب الأصل:*\n"
+                sorted_assets = sorted(stats["by_asset"].items(),
+                                      key=lambda x: x[1]["pnl"], reverse=True)
+                for asset_name, data in sorted_assets[:5]:
+                    asset_wr = (data["wins"] / data["count"] * 100) if data["count"] > 0 else 0
+                    icon = "🟢" if data["pnl"] > 0 else "🔴"
+                    msg += f"   • {icon} *{asset_name}*: {data['count']} صفقة | "
+                    msg += f"{asset_wr:.0f}% WR | `${data['pnl']:+.2f}`\n"
+                msg += "\n"
+            
+            # ─── حسب الجلسة ───
+            if stats.get("by_session"):
+                msg += "🕐 *حسب الجلسة:*\n"
+                for session, data in stats["by_session"].items():
+                    if data["count"] == 0:
+                        continue
+                    s_wr = (data["wins"] / data["count"] * 100) if data["count"] > 0 else 0
+                    icon = "🟢" if data["pnl"] > 0 else "🔴"
+                    msg += f"   • {icon} *{session}*: {data['count']} | {s_wr:.0f}% WR | `${data['pnl']:+.2f}`\n"
+                msg += "\n"
+            
+            # ─── أفضل/أسوأ ───
+            if stats.get("best_trade"):
+                bt = stats["best_trade"]
+                msg += f"🏆 *أفضل صفقة:* {bt.get('asset')} {bt.get('action')} `+{bt.get('pnl_pct', 0):.2f}%`\n"
+            if stats.get("worst_trade"):
+                wt = stats["worst_trade"]
+                msg += f"💔 *أسوأ صفقة:* {wt.get('asset')} {wt.get('action')} `{wt.get('pnl_pct', 0):.2f}%`\n"
+            msg += "\n"
+            
+            # ─── النصيحة ───
+            msg += "═══════════════════════════\n"
+            msg += "💡 *تحليل سريع:*\n"
+            
+            tips = []
+            if wr < 50:
+                tips.append("• نسبة الفوز أقل من 50% — راجع معايير الدخول")
+            if pf < 1.5:
+                tips.append("• Profit Factor ضعيف — كبّر الـTP أو ضيّق الـSL")
+            
+            # أفضل جلسة
+            if stats.get("by_session"):
+                best_session = max(stats["by_session"].items(),
+                                  key=lambda x: x[1]["pnl"] if x[1]["count"] > 0 else -float('inf'))
+                if best_session[1]["count"] >= 3:
+                    tips.append(f"• ركّز أكثر على *{best_session[0]} session* (أفضل أداء)")
+            
+            # أفضل أصل
+            if stats.get("by_asset"):
+                best_asset = max(stats["by_asset"].items(),
+                                key=lambda x: x[1]["pnl"])
+                if best_asset[1]["count"] >= 3 and best_asset[1]["pnl"] > 0:
+                    tips.append(f"• تخصصك في *{best_asset[0]}* جيد")
+            
+            if not tips:
+                tips.append("• أداؤك ممتاز! استمر بنفس الانضباط")
+            
+            for tip in tips:
+                msg += f"{tip}\n"
+            
+            await send_long(u, msg)
+        except Exception as e:
+            log.warning(f"Journal error: {e}")
+            await u.message.reply_text(f"⚠️ خطأ: {str(e)[:100]}")
+        return
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # 🛡️ RISK PROTECTION — إعدادات حماية الحساب
+    # ═══════════════════════════════════════════════════════════════════
+    if text in ("حماية", "protection", "حماية_حساب", "اعدادات_مخاطر", "risk_settings"):
+        settings = risk_protection_get(chat_id)
+        
+        msg = "🛡️ *Risk Protection Settings*\n"
+        msg += "═══════════════════════════\n\n"
+        
+        # ─── الحالة الحالية ───
+        if settings.get("is_locked"):
+            msg += "🔒 *حسابك في وضع القفل!*\n"
+            msg += f"السبب: {settings.get('lock_reason', '—')}\n"
+            try:
+                until = datetime.fromisoformat(settings["locked_until"])
+                hrs = (until - datetime.now(timezone.utc)).total_seconds() / 3600
+                msg += f"⏰ متبقي: {hrs:.1f} ساعة\n\n"
+            except Exception:
+                pass
+            msg += "اكتب `الغاء_حماية` لفك القفل يدوياً\n\n"
+        else:
+            msg += "✅ *الحماية نشطة (الحساب آمن)*\n\n"
+        
+        # ─── الإعدادات ───
+        msg += "⚙️ *الحدود الحالية:*\n"
+        msg += f"   • حد الخسارة اليومي: *-{settings.get('max_daily_loss_pct', 5)}%*\n"
+        msg += f"   • حد الخسارة الأسبوعي: *-{settings.get('max_weekly_loss_pct', 10)}%*\n"
+        msg += f"   • خسائر متتالية: *{settings.get('max_consecutive_losses', 3)}* (للقفل)\n"
+        msg += f"   • صفقات مفتوحة كحد أقصى: *{settings.get('max_open_trades', 5)}*\n"
+        msg += f"   • مدة القفل: *{settings.get('cooldown_hours', 24)}* ساعة\n\n"
+        
+        # ─── الإحصاءات ───
+        msg += "📊 *إحصاءات اليوم:*\n"
+        daily = settings.get('daily_pnl_pct', 0)
+        d_icon = "🟢" if daily >= 0 else "🔴"
+        msg += f"   • {d_icon} PnL اليومي: `{daily:+.2f}%`\n"
+        msg += f"   • PnL الأسبوعي: `{settings.get('weekly_pnl_pct', 0):+.2f}%`\n"
+        msg += f"   • خسائر متتالية: {settings.get('consecutive_losses', 0)}\n\n"
+        
+        msg += "─────────────────────────\n"
+        msg += "*التعديل (اختياري):*\n"
+        msg += "`حد_يومي 7` — تغيير الحد اليومي لـ7%\n"
+        msg += "`حد_صفقات 3` — تقليل المسموح لـ3 صفقات\n"
+        msg += "`الغاء_حماية` — فك القفل (إذا مفعّل)\n"
+        msg += "`ايقاف_حماية` — تعطيل كامل (غير موصى)\n"
+        
+        await u.message.reply_text(msg, parse_mode="Markdown")
+        return
+    
+    # ─── تعديل الحدود ───
+    if text.startswith(("حد_يومي", "daily_limit")):
+        parts = text.split()
+        if len(parts) < 2:
+            await u.message.reply_text("الصيغة: `حد_يومي 5`")
+            return
+        try:
+            new_limit = float(parts[1])
+            if new_limit < 1 or new_limit > 20:
+                await u.message.reply_text("⚠️ القيمة لازم تكون بين 1-20%")
+                return
+            risk_protection_update(chat_id, max_daily_loss_pct=new_limit)
+            await u.message.reply_text(
+                f"✅ *تم تعديل الحد اليومي*\nالحد الجديد: -{new_limit}%",
+                parse_mode="Markdown"
+            )
+        except ValueError:
+            await u.message.reply_text("⚠️ القيمة لازم تكون رقم")
+        return
+    
+    if text.startswith(("حد_صفقات", "max_trades")):
+        parts = text.split()
+        if len(parts) < 2:
+            await u.message.reply_text("الصيغة: `حد_صفقات 3`")
+            return
+        try:
+            new_max = int(parts[1])
+            if new_max < 1 or new_max > 20:
+                await u.message.reply_text("⚠️ القيمة لازم تكون بين 1-20")
+                return
+            risk_protection_update(chat_id, max_open_trades=new_max)
+            await u.message.reply_text(
+                f"✅ تم تعديل: {new_max} صفقات كحد أقصى",
+                parse_mode="Markdown"
+            )
+        except ValueError:
+            await u.message.reply_text("⚠️ القيمة لازم تكون رقم")
+        return
+    
+    if text in ("الغاء_حماية", "إلغاء_حماية", "unlock"):
+        settings = risk_protection_get(chat_id)
+        if not settings.get("is_locked"):
+            await u.message.reply_text("✅ الحساب غير مقفل أصلاً")
+            return
+        risk_protection_update(
+            chat_id, is_locked=0, lock_reason=None, locked_until=None
+        )
+        await u.message.reply_text(
+            "🔓 *تم فك القفل يدوياً*\n\n"
+            "⚠️ تذكّر: القفل وُجد لحمايتك من overtrading.\n"
+            "خذ قسطاً من الراحة قبل الدخول لصفقة جديدة.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if text in ("ايقاف_حماية", "إيقاف_حماية", "disable_protection"):
+        risk_protection_update(chat_id, enabled=0)
+        await u.message.reply_text(
+            "⚠️ *تم تعطيل الحماية بالكامل*\n\n"
+            "🚨 هذا غير موصى به — Drawdown Protection يحمي حسابك من الكوارث.\n"
+            "للتفعيل: `تفعيل_حماية`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if text in ("تفعيل_حماية", "enable_protection"):
+        risk_protection_update(chat_id, enabled=1)
+        await u.message.reply_text(
+            "✅ *تم تفعيل Risk Protection*\nحسابك محمي الآن.",
+            parse_mode="Markdown"
+        )
+        return
     
     # ─── أمر "صفقاتي" ───
     if text in ("صفقاتي", "صفقات", "trades", "my_trades", "متابعاتي", "تتبعاتي"):
@@ -4207,16 +5164,36 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         pnl_d, pnl_p = track_calculate_pnl(trade, exit_price)
         track_close_trade(trade_id, exit_price, "MANUAL", pnl_d, pnl_p)
         
+        # ─── تسجيل في الجورنال ───
+        try:
+            updated_trade = track_get_trade(trade_id)
+            if updated_trade:
+                journal_record_closed_trade(chat_id, updated_trade)
+        except Exception as e:
+            log.warning(f"journal record: {e}")
+        
+        # ─── فحص Risk Protection ───
+        lock_msg = None
+        try:
+            lock_msg = risk_protection_record_trade_close(chat_id, pnl_p, pnl_d)
+        except Exception as e:
+            log.warning(f"risk protection: {e}")
+        
         result_icon = "🟢" if pnl_p > 0 else "🔴"
-        await u.message.reply_text(
+        msg = (
             f"✅ *تم إغلاق Trade #{trade_id}*\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"📊 {trade['asset']} | {trade['action']}\n"
             f"💰 Entry: `{trade['entry_price']:.4f}`\n"
             f"🚪 Exit: `{exit_price:.4f}`\n"
-            f"{result_icon} PnL: `{pnl_p:+.2f}%` (`${pnl_d:+.2f}`)",
-            parse_mode="Markdown"
+            f"{result_icon} PnL: `{pnl_p:+.2f}%` (`${pnl_d:+.2f}`)"
         )
+        
+        # لو تفعّل القفل
+        if lock_msg:
+            msg += f"\n\n🚨 *تنبيه:*\n{lock_msg}\n\n⏰ *تم تفعيل Cooldown*"
+        
+        await u.message.reply_text(msg, parse_mode="Markdown")
         return
     
     # ═══════════════════════════════════════════════════════════════════
