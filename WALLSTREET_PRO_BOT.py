@@ -1372,6 +1372,464 @@ def derive_fed_expectations(prices: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 11.5) SCALPING MODULE — للذهب والفضة والفوركس والبترول
+# ═══════════════════════════════════════════════════════════════════════
+"""
+استراتيجية Scalping احترافية بـ7 مؤشرات على فريمي 1m + 5m:
+1. RSI(7) على 1m       — ذروة شراء/بيع سريعة
+2. EMA Cross (5/13)    — Golden/Death Cross فوري
+3. Bollinger Bands 5m  — Bounce/Squeeze
+4. Volume Spike        — ضغط حقيقي (×2 المتوسط)
+5. Stochastic (14,3)   — تأكيد إضافي
+6. ATR Momentum        — سرعة الحركة
+7. Candle Pattern      — Engulfing/Hammer/Star
+
+SL/TP مخصص للـScalping:
+  - SL: 0.7×ATR (ضيق جداً)
+  - TP1 = 1:1, TP2 = 1:1.5, TP3 = 1:2.5
+  - الإطار الزمني: 5-30 دقيقة
+"""
+
+SCALP_TIMEFRAMES = {
+    "1m":  {"period": "1d",  "interval": "1m",  "label": "1 دقيقة"},
+    "5m":  {"period": "5d",  "interval": "5m",  "label": "5 دقائق"},
+    "15m": {"period": "5d",  "interval": "15m", "label": "15 دقيقة"},
+}
+
+
+def _scalp_rsi(close: pd.Series, period: int = 7) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def _scalp_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _scalp_bollinger(close: pd.Series, period: int = 20, std: float = 2.0):
+    ma = close.rolling(period).mean()
+    sd = close.rolling(period).std()
+    upper = ma + sd * std
+    lower = ma - sd * std
+    return upper, ma, lower
+
+
+def _scalp_atr(df: pd.DataFrame, period: int = 14) -> float:
+    if len(df) < period + 1:
+        return 0
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return float(tr.rolling(period).mean().iloc[-1] or 0)
+
+
+def _scalp_stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
+    low_n = df["Low"].rolling(k_period).min()
+    high_n = df["High"].rolling(k_period).max()
+    k = 100 * (df["Close"] - low_n) / (high_n - low_n).replace(0, np.nan)
+    d = k.rolling(d_period).mean()
+    return k, d
+
+
+def fetch_scalp_data(asset: str, ticker: str) -> Dict:
+    """جلب بيانات 1m + 5m للـScalping.
+    
+    للذهب: استخدم Polygon ticker لسعر دقيق + yfinance للـintraday
+    للأصول الأخرى: yfinance مباشرة
+    
+    Returns: {df_1m, df_5m, current_price, source}
+    """
+    try:
+        # نجيب بيانات 1m (آخر يوم)
+        t = yf.Ticker(ticker)
+        df_1m = t.history(period="1d", interval="1m")
+        df_5m = t.history(period="5d", interval="5m")
+        
+        if df_1m.empty or df_5m.empty:
+            return None
+        
+        current_price = float(df_1m["Close"].iloc[-1])
+        source = "yfinance"
+        
+        # للأصول المدعومة في Polygon: نتحقق من السعر
+        asset_to_poly = {
+            "Gold": "XAU/USD",
+            "Silver": "XAG/USD",
+            "EUR/USD": "EUR/USD",
+            "GBP/USD": "GBP/USD",
+            "USD/JPY": "USD/JPY",
+            "USD/CHF": "USD/CHF",
+            "AUD/USD": "AUD/USD",
+            "Oil": "WTI",
+        }
+        poly_key = asset_to_poly.get(asset)
+        if poly_key:
+            poly_data = polygon_get_asset_price(poly_key)
+            if poly_data:
+                poly_price = poly_data["price"]
+                diff_pct = abs(poly_price - current_price) / poly_price * 100
+                # إذا فرق كبير، نطبق scaling
+                if diff_pct > 5:
+                    scale_factor = poly_price / current_price
+                    for col in ["Open", "High", "Low", "Close"]:
+                        df_1m[col] = df_1m[col] * scale_factor
+                        df_5m[col] = df_5m[col] * scale_factor
+                    current_price = poly_price
+                    source = "polygon_scaled"
+                else:
+                    current_price = poly_price
+                    source = "polygon"
+        
+        return {
+            "df_1m": df_1m,
+            "df_5m": df_5m,
+            "current_price": current_price,
+            "source": source,
+        }
+    except Exception as e:
+        log.warning(f"fetch_scalp_data [{asset}]: {e}")
+        return None
+
+
+def analyze_scalp(asset: str, ticker: str) -> Optional[Dict]:
+    """تحليل Scalping شامل بـ7 مؤشرات.
+    
+    Returns: {
+        "decision": "LONG" / "SHORT" / "WAIT",
+        "score": (bull_score, bear_score),
+        "signals": [...],
+        "warnings": [...],
+        "current_price": float,
+        "sl": float, "tp1": float, "tp2": float, "tp3": float,
+        "duration": "1-15 دقيقة",
+        "leverage_suggestion": "x10-x20",
+    }
+    """
+    data = fetch_scalp_data(asset, ticker)
+    if not data:
+        return None
+    
+    df_1m = data["df_1m"]
+    df_5m = data["df_5m"]
+    price = data["current_price"]
+    
+    if len(df_1m) < 20 or len(df_5m) < 20:
+        return None
+    
+    R = {
+        "asset": asset,
+        "current_price": price,
+        "source": data["source"],
+        "bull": 0,
+        "bear": 0,
+        "signals": [],
+        "warnings": [],
+    }
+    
+    cl1 = df_1m["Close"]
+    hi1 = df_1m["High"]
+    lo1 = df_1m["Low"]
+    op1 = df_1m["Open"]
+    vo1 = df_1m["Volume"] if "Volume" in df_1m.columns else None
+    
+    # ─── 1. RSI(7) على 1m ───
+    rsi7 = float(_scalp_rsi(cl1, 7).iloc[-1])
+    R["rsi7"] = rsi7
+    if rsi7 <= 25:
+        R["bull"] += 2
+        R["signals"].append({"name": "RSI(7) 1m", "icon": "✅", "value": f"{rsi7:.1f}", "note": "ذروة بيع قوية ⚡"})
+    elif rsi7 <= 35:
+        R["bull"] += 1
+        R["signals"].append({"name": "RSI(7) 1m", "icon": "✅", "value": f"{rsi7:.1f}", "note": "ذروة بيع"})
+    elif rsi7 >= 75:
+        R["bear"] += 2
+        R["signals"].append({"name": "RSI(7) 1m", "icon": "🔴", "value": f"{rsi7:.1f}", "note": "ذروة شراء قوية ⚡"})
+    elif rsi7 >= 65:
+        R["bear"] += 1
+        R["signals"].append({"name": "RSI(7) 1m", "icon": "🔴", "value": f"{rsi7:.1f}", "note": "ذروة شراء"})
+    else:
+        R["signals"].append({"name": "RSI(7) 1m", "icon": "⚪", "value": f"{rsi7:.1f}", "note": "محايد"})
+    
+    # ─── 2. EMA Cross (5/13) على 1m ───
+    ema5 = _scalp_ema(cl1, 5)
+    ema13 = _scalp_ema(cl1, 13)
+    ema5_now = float(ema5.iloc[-1])
+    ema13_now = float(ema13.iloc[-1])
+    ema5_prev = float(ema5.iloc[-2])
+    ema13_prev = float(ema13.iloc[-2])
+    
+    if ema5_now > ema13_now and ema5_prev <= ema13_prev:
+        R["bull"] += 2
+        R["signals"].append({"name": "EMA Cross 1m", "icon": "✅", "value": "Golden Cross", "note": "اختراق صعودي ⚡"})
+    elif ema5_now < ema13_now and ema5_prev >= ema13_prev:
+        R["bear"] += 2
+        R["signals"].append({"name": "EMA Cross 1m", "icon": "🔴", "value": "Death Cross", "note": "اختراق هبوطي ⚡"})
+    elif ema5_now > ema13_now:
+        R["bull"] += 1
+        R["signals"].append({"name": "EMA Cross 1m", "icon": "✅", "value": "EMA5 > EMA13", "note": "صعودي"})
+    elif ema5_now < ema13_now:
+        R["bear"] += 1
+        R["signals"].append({"name": "EMA Cross 1m", "icon": "🔴", "value": "EMA5 < EMA13", "note": "هبوطي"})
+    else:
+        R["signals"].append({"name": "EMA Cross 1m", "icon": "⚪", "value": "متشابك", "note": "محايد"})
+    
+    # ─── 3. Bollinger Bands على 5m ───
+    cl5 = df_5m["Close"]
+    bb_upper, bb_mid, bb_lower = _scalp_bollinger(cl5, 20, 2.0)
+    bb_u = float(bb_upper.iloc[-1])
+    bb_m = float(bb_mid.iloc[-1])
+    bb_l = float(bb_lower.iloc[-1])
+    
+    bb_width = (bb_u - bb_l) / bb_m * 100
+    R["bb_width"] = bb_width
+    
+    if price <= bb_l * 1.001:
+        R["bull"] += 2
+        R["signals"].append({"name": "Bollinger 5m", "icon": "✅", "value": "Lower Band", "note": "ارتداد محتمل ⚡"})
+    elif price >= bb_u * 0.999:
+        R["bear"] += 2
+        R["signals"].append({"name": "Bollinger 5m", "icon": "🔴", "value": "Upper Band", "note": "ارتداد هبوطي ⚡"})
+    elif bb_width < 1.0:
+        R["signals"].append({"name": "Bollinger 5m", "icon": "⚠️", "value": f"Squeeze {bb_width:.2f}%", "note": "اختراق وشيك"})
+        R["warnings"].append("Bollinger Squeeze — اختراق قوي وشيك")
+    else:
+        position = (price - bb_l) / (bb_u - bb_l) * 100
+        R["signals"].append({"name": "Bollinger 5m", "icon": "⚪", "value": f"{position:.0f}%", "note": "وسط الباند"})
+    
+    # ─── 4. Volume Spike (لو متاح) ───
+    if vo1 is not None and len(vo1) >= 20:
+        vol_avg = float(vo1.iloc[-20:].mean())
+        vol_now = float(vo1.iloc[-1])
+        if vol_avg > 0:
+            vol_ratio = vol_now / vol_avg
+            R["vol_ratio"] = vol_ratio
+            
+            # اتجاه الشمعة الحالية
+            candle_bullish = cl1.iloc[-1] > op1.iloc[-1]
+            
+            if vol_ratio >= 3.0:
+                if candle_bullish:
+                    R["bull"] += 2
+                    R["signals"].append({"name": "Volume Spike", "icon": "✅", "value": f"×{vol_ratio:.1f}", "note": "ضغط شراء قوي ⚡"})
+                else:
+                    R["bear"] += 2
+                    R["signals"].append({"name": "Volume Spike", "icon": "🔴", "value": f"×{vol_ratio:.1f}", "note": "ضغط بيع قوي ⚡"})
+            elif vol_ratio >= 1.8:
+                if candle_bullish:
+                    R["bull"] += 1
+                    R["signals"].append({"name": "Volume", "icon": "✅", "value": f"×{vol_ratio:.1f}", "note": "حجم شراء جيد"})
+                else:
+                    R["bear"] += 1
+                    R["signals"].append({"name": "Volume", "icon": "🔴", "value": f"×{vol_ratio:.1f}", "note": "حجم بيع جيد"})
+            else:
+                R["signals"].append({"name": "Volume", "icon": "⚪", "value": f"×{vol_ratio:.1f}", "note": "حجم عادي"})
+    else:
+        R["signals"].append({"name": "Volume", "icon": "⚪", "value": "—", "note": "غير متاح للفوركس"})
+    
+    # ─── 5. Stochastic (14,3) على 1m ───
+    k, d = _scalp_stochastic(df_1m, 14, 3)
+    k_now = float(k.iloc[-1]) if not pd.isna(k.iloc[-1]) else 50
+    d_now = float(d.iloc[-1]) if not pd.isna(d.iloc[-1]) else 50
+    R["stoch_k"] = k_now
+    R["stoch_d"] = d_now
+    
+    if k_now < 20 and k_now > d_now:
+        R["bull"] += 1
+        R["signals"].append({"name": "Stochastic", "icon": "✅", "value": f"K={k_now:.0f}", "note": "ذروة بيع + Cross صعودي"})
+    elif k_now > 80 and k_now < d_now:
+        R["bear"] += 1
+        R["signals"].append({"name": "Stochastic", "icon": "🔴", "value": f"K={k_now:.0f}", "note": "ذروة شراء + Cross هبوطي"})
+    else:
+        R["signals"].append({"name": "Stochastic", "icon": "⚪", "value": f"K={k_now:.0f}", "note": "محايد"})
+    
+    # ─── 6. ATR Momentum على 1m ───
+    atr_now = _scalp_atr(df_1m, 14)
+    atr_avg = float(_scalp_atr(df_1m.iloc[:-5], 14)) if len(df_1m) > 20 else atr_now
+    R["atr"] = atr_now
+    
+    atr_pct = (atr_now / price * 100) if price > 0 else 0
+    R["atr_pct"] = atr_pct
+    
+    if atr_avg > 0 and atr_now / atr_avg > 1.4:
+        R["signals"].append({"name": "ATR Momentum", "icon": "⚠️", "value": f"{atr_pct:.3f}%", "note": "تقلّب عالي - Volatility"})
+        R["warnings"].append("ATR مرتفع — احذر الـwhipsaws")
+    else:
+        R["signals"].append({"name": "ATR Momentum", "icon": "⚪", "value": f"{atr_pct:.3f}%", "note": "تقلّب طبيعي"})
+    
+    # ─── 7. Candle Pattern على 1m (Engulfing/Hammer/Star) ───
+    if len(df_1m) >= 3:
+        c0 = df_1m.iloc[-1]  # الحالية
+        c1 = df_1m.iloc[-2]  # السابقة
+        c2 = df_1m.iloc[-3]
+        
+        body0 = abs(c0["Close"] - c0["Open"])
+        body1 = abs(c1["Close"] - c1["Open"])
+        wick_top0 = c0["High"] - max(c0["Open"], c0["Close"])
+        wick_bot0 = min(c0["Open"], c0["Close"]) - c0["Low"]
+        
+        # Bullish Engulfing
+        if (c1["Close"] < c1["Open"] and c0["Close"] > c0["Open"] 
+            and c0["Close"] > c1["Open"] and c0["Open"] < c1["Close"]):
+            R["bull"] += 2
+            R["signals"].append({"name": "Candle Pattern", "icon": "✅", "value": "Bullish Engulfing", "note": "ابتلاع صعودي ⚡"})
+        # Bearish Engulfing
+        elif (c1["Close"] > c1["Open"] and c0["Close"] < c0["Open"]
+              and c0["Close"] < c1["Open"] and c0["Open"] > c1["Close"]):
+            R["bear"] += 2
+            R["signals"].append({"name": "Candle Pattern", "icon": "🔴", "value": "Bearish Engulfing", "note": "ابتلاع هبوطي ⚡"})
+        # Hammer (bullish reversal)
+        elif body0 > 0 and wick_bot0 > body0 * 2 and wick_top0 < body0 * 0.5:
+            R["bull"] += 1
+            R["signals"].append({"name": "Candle Pattern", "icon": "✅", "value": "Hammer", "note": "مطرقة - انعكاس صعودي"})
+        # Shooting Star
+        elif body0 > 0 and wick_top0 > body0 * 2 and wick_bot0 < body0 * 0.5:
+            R["bear"] += 1
+            R["signals"].append({"name": "Candle Pattern", "icon": "🔴", "value": "Shooting Star", "note": "نجمة هابطة"})
+        else:
+            R["signals"].append({"name": "Candle Pattern", "icon": "⚪", "value": "—", "note": "لا نمط واضح"})
+    
+    # ─── القرار النهائي ───
+    score_diff = R["bull"] - R["bear"]
+    if score_diff >= 4:
+        R["decision"] = "LONG"
+        R["decision_strength"] = "STRONG"
+        R["decision_icon"] = "🟢⚡"
+    elif score_diff >= 2:
+        R["decision"] = "LONG"
+        R["decision_strength"] = "MEDIUM"
+        R["decision_icon"] = "🟢"
+    elif score_diff <= -4:
+        R["decision"] = "SHORT"
+        R["decision_strength"] = "STRONG"
+        R["decision_icon"] = "🔴⚡"
+    elif score_diff <= -2:
+        R["decision"] = "SHORT"
+        R["decision_strength"] = "MEDIUM"
+        R["decision_icon"] = "🔴"
+    else:
+        R["decision"] = "WAIT"
+        R["decision_strength"] = "—"
+        R["decision_icon"] = "⏳"
+    
+    # ─── SL/TP المحسوب على ATR ───
+    is_long = R["decision"] == "LONG"
+    sl_distance = atr_now * 0.7  # ضيّق
+    tp1_distance = atr_now * 0.7    # 1:1
+    tp2_distance = atr_now * 1.05   # 1:1.5
+    tp3_distance = atr_now * 1.75   # 1:2.5
+    
+    if R["decision"] in ("LONG", "SHORT"):
+        if is_long:
+            R["sl"] = price - sl_distance
+            R["tp1"] = price + tp1_distance
+            R["tp2"] = price + tp2_distance
+            R["tp3"] = price + tp3_distance
+        else:
+            R["sl"] = price + sl_distance
+            R["tp1"] = price - tp1_distance
+            R["tp2"] = price - tp2_distance
+            R["tp3"] = price - tp3_distance
+        
+        R["sl_pct"] = sl_distance / price * 100
+    else:
+        R["sl"] = R["tp1"] = R["tp2"] = R["tp3"] = None
+        R["sl_pct"] = 0
+    
+    # ─── المدة المتوقعة + الرافعة المقترحة ───
+    if R["decision_strength"] == "STRONG":
+        R["duration"] = "5-15 دقيقة"
+        R["leverage_suggestion"] = "x5-x10 (للفوركس) | x10-x20 (للذهب)"
+    elif R["decision_strength"] == "MEDIUM":
+        R["duration"] = "10-30 دقيقة"
+        R["leverage_suggestion"] = "x3-x5 (محافظ)"
+    else:
+        R["duration"] = "—"
+        R["leverage_suggestion"] = "لا تدخل"
+    
+    return R
+
+
+def format_scalp(R: Dict) -> str:
+    """تنسيق رسالة الـScalping للـTelegram."""
+    if not R:
+        return "⚠️ تعذّر تحليل Scalping — تأكد من توفر البيانات"
+    
+    asset = R["asset"]
+    decision = R["decision"]
+    icon = R["decision_icon"]
+    price = R["current_price"]
+    
+    # تحديد عدد الـdecimals حسب الأصل
+    decimals = 5 if "/" in asset and "JPY" not in asset else 3 if "JPY" in asset else 2
+    
+    lines = []
+    lines.append(f"⚡ *SCALPING — {asset}* {icon}")
+    lines.append("═" * 33)
+    lines.append(f"💰 السعر: `{price:,.{decimals}f}`")
+    lines.append(f"🕐 الوقت: {datetime.now(pytz.timezone(DEFAULT_TZ)).strftime('%H:%M:%S')}")
+    if R.get("source") == "polygon" or R.get("source") == "polygon_scaled":
+        lines.append(f"📡 المصدر: Polygon Real-time ✅")
+    lines.append("")
+    
+    # القرار
+    if decision == "WAIT":
+        lines.append("⏳ *القرار: انتظر*")
+        lines.append(f"_السوق محايد حالياً ({R['bull']} bull vs {R['bear']} bear)_")
+        lines.append("")
+    else:
+        strength = R["decision_strength"]
+        decision_ar = "صفقة شراء سريعة" if decision == "LONG" else "صفقة بيع سريعة"
+        lines.append(f"🎯 *القرار: {decision} — {decision_ar}*")
+        lines.append(f"💪 قوة الإشارة: {strength}")
+        lines.append(f"⏱️ المدة المتوقعة: `{R['duration']}`")
+        lines.append("")
+    
+    # المؤشرات
+    lines.append("📊 *المؤشرات السبعة:*")
+    lines.append("─" * 33)
+    for s in R["signals"]:
+        lines.append(f"{s['icon']} *{s['name']}*: `{s['value']}` — {s['note']}")
+    lines.append("")
+    
+    # Score
+    lines.append(f"📈 *النقاط:* Bull={R['bull']} | Bear={R['bear']}")
+    lines.append("")
+    
+    # SL/TP
+    if R.get("sl"):
+        lines.append("🎯 *مستويات الصفقة:*")
+        lines.append("─" * 33)
+        lines.append(f"🛑 SL: `{R['sl']:,.{decimals}f}` ({R['sl_pct']:.2f}% بعيد)")
+        lines.append(f"🟢 TP1: `{R['tp1']:,.{decimals}f}` (R:R 1:1)")
+        lines.append(f"🟡 TP2: `{R['tp2']:,.{decimals}f}` (R:R 1:1.5)")
+        lines.append(f"🔴 TP3: `{R['tp3']:,.{decimals}f}` (R:R 1:2.5)")
+        lines.append("")
+        lines.append(f"⚙️ *الرافعة المقترحة:* {R['leverage_suggestion']}")
+        lines.append("")
+        lines.append("📋 *إدارة الصفقة:*")
+        lines.append("• اقفل 50% عند TP1")
+        lines.append("• اقفل 30% عند TP2 + حرّك SL لـbreakeven")
+        lines.append("• اترك 20% للـTP3 (runner)")
+        lines.append("")
+    
+    # تحذيرات
+    if R.get("warnings"):
+        lines.append("⚠️ *تحذيرات:*")
+        for w in R["warnings"]:
+            lines.append(f"• {w}")
+        lines.append("")
+    
+    lines.append("⚠️ _Scalping = مخاطرة عالية — لا تستخدم >1% من رأس المال_")
+    lines.append("⚠️ _تحليل تعليمي — ليس نصيحة استثمارية_")
+    
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 12) AI BRAINS — Claude + Gemini + OpenAI
 # ═══════════════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = """أنت محلل تنفيذي في صندوق تحوّط Wall Street ($5B AUM).
@@ -2429,12 +2887,21 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "`توصية` — توصية الذهب + Smart Risk\n"
         "`توصية دولار` — توصية الدولار/DXY\n"
         "`أداء` — تقرير دقة التوصيات\n\n"
-        "🛡️ *إدارة المخاطر الذكية* ✨ جديد:\n"
-        "`مخاطر ذهب buy 2650` — تحليل مخاطر يدوي\n"
-        "`مخاطر ذهب sell 2680 5000` — مع رأس مال\n"
-        "  ▸ 3 مستويات SL + Danger Zones\n"
-        "  ▸ 3 أهداف TP + احتمالات + Reject Zones\n"
+        "🛡️ *إدارة المخاطر الذكية:*\n"
+        "`مخاطر ذهب buy 4600 4000` — تحليل مخاطر يدوي\n"
+        "`مخاطر فضة sell 30 4000` — كل الأصول مدعومة\n"
+        "`مخاطر eurusd buy 1.085 4000`\n"
+        "  ▸ Liquidity Pools (BSL/SSL) + Smart Money\n"
+        "  ▸ 3 مستويات SL خلف الـpools\n"
+        "  ▸ 3 أهداف TP عند الـpools\n"
         "  ▸ Position Sizing + Partial Close\n\n"
+        "⚡ *Scalping Analysis* ✨ جديد:\n"
+        "`سكالب ذهب` — تحليل 7 مؤشرات على 1m/5m\n"
+        "`سكالب eurusd` / `سكالب gbpusd`\n"
+        "`سكالب فضة` / `سكالب بترول`\n"
+        "  ▸ RSI(7) + EMA Cross + Bollinger\n"
+        "  ▸ Volume + Stochastic + ATR + Candle\n"
+        "  ▸ قرار LONG/SHORT/WAIT + SL/TP ضيق\n\n"
         "📊 *التحليل العميق:*\n"
         "`تحليل` — تحليل سوق شامل\n"
         "`فني` — التحليل الفني (RSI/MACD/EMA/BB/ICT)\n"
@@ -2523,6 +2990,88 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         for m in msgs:
             await send_long(u, m)
             await asyncio.sleep(0.4)
+        return
+    
+    # ═══ ⚡ SCALPING — تحليل سريع (1m + 5m) ═══
+    # الصيغة: سكالب [الأصل]
+    # أمثلة: سكالب ذهب / سكالب فضة / سكالب eurusd / سكالب بترول
+    if text.startswith(("سكالب", "scalp", "سكالبينج", "scalping")):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await u.message.reply_text(
+                "⚡ *Scalping Analysis*\n\n"
+                "الصيغة: `سكالب [الأصل]`\n\n"
+                "*أمثلة:*\n"
+                "• `سكالب ذهب`\n"
+                "• `سكالب فضة`\n"
+                "• `سكالب eurusd`\n"
+                "• `سكالب gbpusd`\n"
+                "• `سكالب usdjpy`\n"
+                "• `سكالب بترول`\n\n"
+                "📊 *البوت يحلل 7 مؤشرات على فريم 1m + 5m:*\n"
+                "1. RSI(7) 1m\n"
+                "2. EMA Cross (5/13)\n"
+                "3. Bollinger Bands 5m\n"
+                "4. Volume Spike\n"
+                "5. Stochastic\n"
+                "6. ATR Momentum\n"
+                "7. Candle Pattern\n\n"
+                "⚡ يعطي قرار LONG/SHORT/WAIT + SL/TP ضيق",
+                parse_mode="Markdown"
+            )
+            return
+        
+        asset_raw = parts[1].lower().strip()
+        # ─── خريطة الأصول ───
+        scalp_asset_map = {
+            # الذهب
+            "ذهب": ("Gold", "GC=F"), "gold": ("Gold", "GC=F"),
+            "xauusd": ("Gold", "GC=F"), "xau": ("Gold", "GC=F"),
+            # الفضة
+            "فضة": ("Silver", "SI=F"), "silver": ("Silver", "SI=F"),
+            "xagusd": ("Silver", "SI=F"), "xag": ("Silver", "SI=F"),
+            # Forex
+            "eurusd": ("EUR/USD", "EURUSD=X"), "eur": ("EUR/USD", "EURUSD=X"), "يورو": ("EUR/USD", "EURUSD=X"),
+            "gbpusd": ("GBP/USD", "GBPUSD=X"), "gbp": ("GBP/USD", "GBPUSD=X"), "باوند": ("GBP/USD", "GBPUSD=X"),
+            "usdjpy": ("USD/JPY", "JPY=X"), "jpy": ("USD/JPY", "JPY=X"), "ين": ("USD/JPY", "JPY=X"),
+            "usdchf": ("USD/CHF", "CHF=X"), "chf": ("USD/CHF", "CHF=X"),
+            "audusd": ("AUD/USD", "AUDUSD=X"), "aud": ("AUD/USD", "AUDUSD=X"),
+            # البترول
+            "بترول": ("Oil", "CL=F"), "نفط": ("Oil", "CL=F"), "oil": ("Oil", "CL=F"), "wti": ("Oil", "CL=F"),
+        }
+        
+        asset_info = scalp_asset_map.get(asset_raw)
+        if not asset_info:
+            await u.message.reply_text(
+                "⚠️ الأصل غير مدعوم في Scalping.\n\n"
+                "*الأصول المتاحة:*\n"
+                "🥇 ذهب / gold | 🥈 فضة / silver\n"
+                "💱 eurusd / gbpusd / usdjpy / usdchf / audusd\n"
+                "🛢️ بترول / oil / wti",
+                parse_mode="Markdown"
+            )
+            return
+        
+        asset, ticker = asset_info
+        
+        await u.message.reply_text(
+            f"⚡ *Scalping Analysis — {asset}*\n_جاري تحليل 7 مؤشرات..._",
+            parse_mode="Markdown"
+        )
+        
+        try:
+            scalp_result = analyze_scalp(asset, ticker)
+            if not scalp_result:
+                await u.message.reply_text(
+                    "⚠️ تعذّر تحليل Scalping — تأكد من توفر بيانات 1m/5m"
+                )
+                return
+            
+            text_out = format_scalp(scalp_result)
+            await send_long(u, text_out)
+        except Exception as e:
+            log.warning(f"Scalp error: {e}")
+            await u.message.reply_text(f"⚠️ خطأ: {str(e)[:100]}")
         return
     
     # ═══ التوصيات ═══
