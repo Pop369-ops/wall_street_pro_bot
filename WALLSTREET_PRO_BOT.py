@@ -345,14 +345,115 @@ SYMBOLS = {
 }
 
 
+def get_gold_dataframe_scaled(period: str = "6mo", interval: str = "1d"):
+    """يجلب تاريخ الذهب من yfinance، ويحوّله للسعر الصحيح لو yfinance قديم.
+    
+    المنطق:
+    - يجيب df من yfinance (GC=F)
+    - يجيب السعر الحالي من Polygon
+    - لو الفرق > 5% بين آخر close و Polygon → نطبق scaling factor
+    - الـscaling يحافظ على *النسب* (الـpattern و الـvolatility النسبية)
+    
+    يرجّع: (df_scaled, scale_info dict)
+        df_scaled: DataFrame مع OHLC مُحدَّث للسعر الحالي
+        scale_info: {"applied": bool, "factor": float, "yf_last": float, "poly_price": float}
+    """
+    try:
+        t = yf.Ticker("GC=F")
+        df = t.history(period=period, interval=interval)
+        if df.empty:
+            return None, {"applied": False, "error": "yfinance empty"}
+        
+        yf_last = float(df["Close"].iloc[-1])
+        poly_data = polygon_get_gold_price()
+        
+        if not poly_data:
+            # ما عندنا سعر صحيح من Polygon — نرجّع df زي ما هو
+            return df, {"applied": False, "yf_last": yf_last, "poly_price": None}
+        
+        poly_price = poly_data["price"]
+        diff_pct = abs(poly_price - yf_last) / poly_price * 100
+        
+        if diff_pct < 5:
+            # متقاربين → df سليم، ما نحتاجش scaling
+            return df, {
+                "applied": False, "factor": 1.0,
+                "yf_last": yf_last, "poly_price": poly_price,
+            }
+        
+        # ⚠️ Scaling factor needed: yfinance contract منتهي
+        # نستخدم multiplicative scaling (ضرب) عشان نحافظ على النسب
+        scale_factor = poly_price / yf_last
+        df_scaled = df.copy()
+        for col in ["Open", "High", "Low", "Close"]:
+            if col in df_scaled.columns:
+                df_scaled[col] = df_scaled[col] * scale_factor
+        # Volume ما نلمسهاش
+        
+        log.warning(
+            f"📊 Gold DataFrame scaled: factor={scale_factor:.4f} "
+            f"(yf_last=${yf_last:.2f} → poly=${poly_price:.2f})"
+        )
+        
+        return df_scaled, {
+            "applied": True,
+            "factor": scale_factor,
+            "yf_last": yf_last,
+            "poly_price": poly_price,
+            "diff_pct": diff_pct,
+        }
+    except Exception as e:
+        log.warning(f"get_gold_dataframe_scaled: {e}")
+        return None, {"applied": False, "error": str(e)}
+
+
 def fetch_prices() -> Dict[str, Dict]:
-    """جلب الأسعار اللحظية + cache 60 ثانية."""
+    """جلب الأسعار اللحظية + cache 60 ثانية.
+    
+    للذهب: يستخدم Polygon (XAU/USD) لو متاح، ثم yfinance كـfallback.
+    لباقي الأصول: yfinance.
+    """
     cached = cache_get("prices_all")
     if cached:
         return cached
     
     out = {}
+    
+    # ─── Gold: Polygon أولاً (أدق بكتير) ───
+    poly_gold = polygon_get_gold_price()
+    if poly_gold:
+        out["Gold (XAUUSD)"] = {
+            "price": poly_gold["price"],
+            "change_pct": poly_gold["change_pct"],
+            "week_pct": 0,  # سيُحسب من yfinance لاحقاً
+            "ticker": "C:XAUUSD",
+            "source": "polygon",
+            "bid": poly_gold["bid"],
+            "ask": poly_gold["ask"],
+            "day_high": poly_gold["day_high"],
+            "day_low": poly_gold["day_low"],
+        }
+    
+    # ─── باقي الأصول من yfinance ───
     for name, ticker in SYMBOLS.items():
+        # تخطي الذهب لو جبناه من Polygon
+        if name == "Gold (XAUUSD)" and "Gold (XAUUSD)" in out:
+            # نجيب الـweekly من yfinance بس عشان نكمل الـweek_pct
+            try:
+                t = yf.Ticker(ticker)
+                hist = t.history(period="5d", interval="1d")
+                if not hist.empty and len(hist) >= 2:
+                    yf_last = float(hist["Close"].iloc[-1])
+                    yf_week = float(hist["Close"].iloc[0])
+                    poly_price = out["Gold (XAUUSD)"]["price"]
+                    # تحقق إن yfinance مش outdated
+                    if abs(poly_price - yf_last) / poly_price < 0.05:
+                        # متقاربة → نستخدم weekly من yfinance
+                        out["Gold (XAUUSD)"]["week_pct"] = (yf_last - yf_week) / yf_week * 100
+            except Exception as e:
+                log.warning(f"yf gold week: {e}")
+            continue
+        
         try:
             t = yf.Ticker(ticker)
             hist = t.history(period="5d", interval="1d")
@@ -368,9 +469,32 @@ def fetch_prices() -> Dict[str, Dict]:
                 "change_pct": chg_d,
                 "week_pct": chg_w,
                 "ticker": ticker,
+                "source": "yfinance",
             }
         except Exception as e:
             log.warning(f"price [{name}]: {e}")
+    
+    # ─── Gold fallback لو Polygon فشل ───
+    if "Gold (XAUUSD)" not in out:
+        try:
+            t = yf.Ticker("GC=F")
+            hist = t.history(period="5d", interval="1d")
+            if not hist.empty:
+                last = float(hist["Close"].iloc[-1])
+                prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else last
+                week = float(hist["Close"].iloc[0]) if len(hist) >= 5 else prev
+                # ⚠️ تحذير لو السعر يبدو قديم
+                if last < 3000:
+                    log.warning(f"⚠️ Gold price from yfinance looks outdated: ${last:.2f}")
+                out["Gold (XAUUSD)"] = {
+                    "price": last,
+                    "change_pct": (last - prev) / prev * 100 if prev else 0,
+                    "week_pct": (last - week) / week * 100 if week else 0,
+                    "ticker": "GC=F",
+                    "source": "yfinance_fallback",
+                }
+        except Exception as e:
+            log.warning(f"gold fallback: {e}")
     
     cache_set("prices_all", out, ttl_seconds=PRICE_CACHE_TTL)
     return out
@@ -422,8 +546,110 @@ def polygon_get(endpoint: str, params: Dict = None, return_error: bool = False) 
     return None
 
 
+def polygon_get_gold_price() -> Optional[Dict]:
+    """جلب سعر الذهب الفوري من Polygon.
+    
+    يحاول 3 مسارات بالترتيب:
+    1. C:XAUUSD على forex snapshot — الأفضل لو الخطة تشمله
+    2. /v1/conversion/XAU/USD — fallback لو snapshot ما يدعم XAU
+    3. None — لو كل المسارات فشلت
+    
+    Returns: {price, bid, ask, change_pct, day_high, day_low, prev_close, source}
+            أو None لو فشل
+    """
+    cache_key = "poly_gold_price"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+    
+    if not POLYGON_API_KEY:
+        return None
+    
+    # ═══ المسار 1: Forex Snapshot (C:XAUUSD) ═══
+    data = polygon_get("/v2/snapshot/locale/global/markets/forex/tickers/C:XAUUSD")
+    if data and data.get("status") == "OK":
+        ticker_data = data.get("ticker", {})
+        if ticker_data:
+            last_quote = ticker_data.get("lastQuote", {}) or {}
+            day = ticker_data.get("day", {}) or {}
+            prev_day = ticker_data.get("prevDay", {}) or {}
+            
+            bid = last_quote.get("b", 0)
+            ask = last_quote.get("a", 0)
+            mid = (bid + ask) / 2 if (bid and ask) else (bid or ask)
+            
+            if mid and mid > 100:  # sanity check (الذهب أكثر من $100)
+                prev_close = prev_day.get("c", 0)
+                change_pct = ((mid - prev_close) / prev_close * 100) if (prev_close and mid) else 0
+                
+                result = {
+                    "price": mid,
+                    "bid": bid,
+                    "ask": ask,
+                    "spread": (ask - bid) if (ask and bid) else 0,
+                    "day_high": day.get("h", 0) or mid,
+                    "day_low": day.get("l", 0) or mid,
+                    "prev_close": prev_close or mid,
+                    "change_pct": change_pct,
+                    "source": "polygon_forex_snapshot",
+                }
+                cache_set(cache_key, result, ttl_seconds=30)
+                return result
+    
+    # ═══ المسار 2: Currency Conversion (XAU → USD) ═══
+    data = polygon_get("/v1/conversion/XAU/USD", {"amount": 1, "precision": 2})
+    if data and data.get("converted") is not None:
+        rate = float(data["converted"])
+        if rate > 100:  # sanity check
+            result = {
+                "price": rate,
+                "bid": rate,
+                "ask": rate,
+                "spread": 0,
+                "day_high": rate,
+                "day_low": rate,
+                "prev_close": rate,
+                "change_pct": 0,
+                "source": "polygon_conversion",
+            }
+            cache_set(cache_key, result, ttl_seconds=30)
+            return result
+    
+    # ═══ المسار 3: GLD ETF Snapshot (يحتاج Stocks plan) ═══
+    # GLD ≈ سعر الذهب / 10، فبنضرب × 10
+    data = polygon_get("/v2/snapshot/locale/us/markets/stocks/tickers/GLD")
+    if data and data.get("status") == "OK":
+        ticker_data = data.get("ticker", {})
+        if ticker_data:
+            day = ticker_data.get("day", {}) or {}
+            last_trade = ticker_data.get("lastTrade", {}) or {}
+            prev_day = ticker_data.get("prevDay", {}) or {}
+            
+            gld_price = last_trade.get("p", 0) or day.get("c", 0)
+            if gld_price > 50:  # GLD تقريباً > $50
+                gold_price = gld_price * 10  # تقدير تقريبي
+                prev_gld = prev_day.get("c", 0)
+                change_pct = ((gld_price - prev_gld) / prev_gld * 100) if prev_gld else 0
+                
+                result = {
+                    "price": gold_price,
+                    "bid": gold_price,
+                    "ask": gold_price,
+                    "spread": 0,
+                    "day_high": (day.get("h", 0) or gld_price) * 10,
+                    "day_low": (day.get("l", 0) or gld_price) * 10,
+                    "prev_close": prev_gld * 10 if prev_gld else gold_price,
+                    "change_pct": change_pct,
+                    "source": "polygon_gld_etf",
+                }
+                cache_set(cache_key, result, ttl_seconds=30)
+                return result
+    
+    return None
+
+
 def polygon_fx_quote(from_curr: str = "EUR", to_curr: str = "USD") -> Optional[Dict]:
-    """آخر سعر FX من Polygon."""
+    """آخر سعر FX من Polygon (currency conversion endpoint)."""
     cache_key = f"poly_fx_{from_curr}_{to_curr}"
     cached = cache_get(cache_key)
     if cached:
@@ -889,31 +1115,70 @@ def detect_market_structure(df: pd.DataFrame, lookback: int = 30) -> str:
 
 
 def technical_analysis(ticker: str = "GC=F") -> Dict:
-    """تحليل فني شامل."""
+    """تحليل فني شامل.
+    
+    للذهب (GC=F):
+    - السعر الحالي من Polygon (XAU/USD) — أدق
+    - DataFrame من yfinance، مع scaling لو yfinance contract منتهي
+    - كل المؤشرات (RSI/MACD/EMA/BB/ATR/OBs/FVGs) تُحسب من DataFrame المُحدَّث
+    - النتيجة: كل القيم متناسقة مع السعر الحالي الصحيح
+    
+    للأصول الأخرى: yfinance طبيعي.
+    """
     cache_key = f"ta_{ticker}"
     cached = cache_get(cache_key)
     if cached:
         return cached
     try:
-        t = yf.Ticker(ticker)
-        df_1d = t.history(period="6mo", interval="1d")
-        df_4h = t.history(period="60d", interval="1h")  # كبديل لـ 4H
-        if df_1d.empty:
+        # ─── جلب البيانات ───
+        scale_info = {"applied": False}
+        
+        if ticker == "GC=F":
+            # للذهب: استخدم scaled DataFrame
+            df_1d, scale_info = get_gold_dataframe_scaled(period="6mo", interval="1d")
+            df_4h, _ = get_gold_dataframe_scaled(period="60d", interval="1h")
+            if df_1d is None or df_1d.empty:
+                # fallback: yfinance خام بدون scaling
+                t = yf.Ticker(ticker)
+                df_1d = t.history(period="6mo", interval="1d")
+                df_4h = t.history(period="60d", interval="1h")
+        else:
+            # باقي الأصول: yfinance طبيعي
+            t = yf.Ticker(ticker)
+            df_1d = t.history(period="6mo", interval="1d")
+            df_4h = t.history(period="60d", interval="1h")
+        
+        if df_1d is None or df_1d.empty:
             return {}
         
+        # ─── حساب المؤشرات ───
         closes = df_1d["Close"]
         rsi = calc_rsi(closes)
         macd, signal, hist = calc_macd(closes)
         emas = calc_emas(closes)
         bb = calc_bollinger(closes)
         atr = calc_atr(df_1d)
-        bull_obs, bear_obs = find_order_blocks(df_4h if not df_4h.empty else df_1d)
+        bull_obs, bear_obs = find_order_blocks(df_4h if (df_4h is not None and not df_4h.empty) else df_1d)
         bull_fvg, bear_fvg = find_fvg(df_1d)
         structure = detect_market_structure(df_1d)
         
         last_price = float(closes.iloc[-1])
+        price_source = "yfinance"
+        warning = None
         
-        # تفسير RSI
+        # تحديد المصدر والتحذير
+        if ticker == "GC=F":
+            if scale_info.get("applied"):
+                price_source = "polygon_with_scaled_history"
+                warning = (
+                    f"تم تعديل التاريخ التلقائي: yfinance contract منتهي "
+                    f"(${scale_info['yf_last']:.2f}) → Polygon (${scale_info['poly_price']:.2f}). "
+                    f"النسب والـpatterns محفوظة."
+                )
+            elif scale_info.get("poly_price"):
+                price_source = "polygon"
+        
+        # ─── تفسير المؤشرات ───
         if rsi > 70:
             rsi_signal = "🔴 ذروة شراء"
         elif rsi < 30:
@@ -921,7 +1186,6 @@ def technical_analysis(ticker: str = "GC=F") -> Dict:
         else:
             rsi_signal = "🟡 محايد"
         
-        # تفسير MACD
         if hist > 0 and macd > signal:
             macd_signal = "🟢 Bullish"
         elif hist < 0 and macd < signal:
@@ -929,7 +1193,7 @@ def technical_analysis(ticker: str = "GC=F") -> Dict:
         else:
             macd_signal = "🟡 محايد"
         
-        # تفسير EMAs
+        # EMAs (الكل في نفس الـscale دلوقتي)
         if last_price > emas["ema_20"] > emas["ema_50"] > emas["ema_200"]:
             ema_trend = "🟢 صعودي قوي (كل EMAs مرتبة)"
         elif last_price < emas["ema_20"] < emas["ema_50"] < emas["ema_200"]:
@@ -937,7 +1201,7 @@ def technical_analysis(ticker: str = "GC=F") -> Dict:
         else:
             ema_trend = "🟡 مختلط"
         
-        # موقع السعر من BB
+        # Bollinger Bands
         if last_price > bb["upper"]:
             bb_signal = "🔴 فوق Upper Band - تشبع شرائي"
         elif last_price < bb["lower"]:
@@ -949,6 +1213,8 @@ def technical_analysis(ticker: str = "GC=F") -> Dict:
         result = {
             "ticker": ticker,
             "price": last_price,
+            "price_source": price_source,
+            "warning": warning,
             "rsi": rsi,
             "rsi_signal": rsi_signal,
             "macd": macd,
@@ -1374,10 +1640,18 @@ def build_recommendation(asset: str = "Gold", chat_id: str = None) -> Dict:
                 ta_full = technical_analysis(ta_ticker)
                 
                 # نحتاج DataFrame خام للـSwing detection
-                t = yf.Ticker(ta_ticker)
-                df_daily = t.history(period="6mo", interval="1d")
+                # للذهب: نستخدم scaled DataFrame ليكون متناسق مع السعر الصحيح
+                if asset == "Gold":
+                    df_daily, _ = get_gold_dataframe_scaled(period="6mo", interval="1d")
+                    if df_daily is None or df_daily.empty:
+                        # fallback لو فشل
+                        t = yf.Ticker(ta_ticker)
+                        df_daily = t.history(period="6mo", interval="1d")
+                else:
+                    t = yf.Ticker(ta_ticker)
+                    df_daily = t.history(period="6mo", interval="1d")
                 
-                if ta_full and not df_daily.empty:
+                if ta_full and df_daily is not None and not df_daily.empty:
                     risk_data = smart_risk.build_full_risk_analysis(
                         entry=entry,
                         action=action,
@@ -2054,7 +2328,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     
     # ═══ التوصيات ═══
-    if text in ("توصية", "توصيه", "recommend"):
+    if text in ("توصية", "توصيه", "recommend", "ذهب", "توصية ذهب", "توصيه ذهب", "gold"):
         await u.message.reply_text(
             "⏳ *جاري بناء توصية الذهب...*\n_(60 ثانية)_",
             parse_mode="Markdown")
@@ -2064,7 +2338,7 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.3)
         return
     
-    if text in ("توصية دولار", "توصية الدولار"):
+    if text in ("توصية دولار", "توصية الدولار", "دولار", "dollar", "dxy"):
         await u.message.reply_text("⏳ *توصية الدولار...*", parse_mode="Markdown")
         rec = build_recommendation(asset="USD/DXY", chat_id=chat_id)
         for m in format_recommendation(rec):
@@ -2109,7 +2383,109 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await send_long(u, format_cot(cot))
         return
     
-    if text in ("خيارات", "options", "opt"):
+    if text in ("سعر_ذهب", "سعر ذهب", "gold_price", "ذهب_الآن", "gold_now"):
+        await u.message.reply_text("⏳ *جاري فحص كل مصادر سعر الذهب...*", parse_mode="Markdown")
+        
+        msg = "🥇 *تشخيص سعر الذهب — كل المصادر*\n"
+        msg += "━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        # ═══ Polygon Forex Snapshot (C:XAUUSD) ═══
+        msg += "*1️⃣ Polygon — Forex Snapshot (C:XAUUSD):*\n"
+        if not POLYGON_API_KEY:
+            msg += "   ❌ POLYGON_API_KEY غير موجود\n\n"
+        else:
+            data = polygon_get(
+                "/v2/snapshot/locale/global/markets/forex/tickers/C:XAUUSD",
+                return_error=True,
+            )
+            if isinstance(data, dict) and data.get("_error"):
+                msg += f"   ❌ {data.get('_message', 'فشل')}\n"
+                if data.get("_error") == "plan":
+                    msg += "   _XAU/USD غير متاح في خطتك الحالية_\n"
+                msg += "\n"
+            elif data and data.get("status") == "OK" and data.get("ticker"):
+                td = data["ticker"]
+                lq = td.get("lastQuote", {}) or {}
+                bid, ask = lq.get("b", 0), lq.get("a", 0)
+                mid = (bid + ask) / 2 if (bid and ask) else 0
+                if mid:
+                    msg += f"   ✅ السعر: `${mid:,.2f}`\n"
+                    msg += f"   Bid/Ask: `${bid:,.2f}` / `${ask:,.2f}`\n\n"
+                else:
+                    msg += "   ⚠️ بيانات فارغة (السوق مغلق؟)\n\n"
+            else:
+                msg += "   ⚠️ لا يوجد رد صحيح\n\n"
+        
+        # ═══ Polygon Currency Conversion (XAU → USD) ═══
+        msg += "*2️⃣ Polygon — Conversion (XAU/USD):*\n"
+        if not POLYGON_API_KEY:
+            msg += "   ❌ غير متاح\n\n"
+        else:
+            data = polygon_get(
+                "/v1/conversion/XAU/USD",
+                {"amount": 1, "precision": 2},
+                return_error=True,
+            )
+            if isinstance(data, dict) and data.get("_error"):
+                msg += f"   ❌ {data.get('_message', 'فشل')}\n\n"
+            elif data and data.get("converted"):
+                msg += f"   ✅ السعر: `${data['converted']:,.2f}`\n\n"
+            else:
+                msg += "   ⚠️ لا يوجد converted في الرد\n\n"
+        
+        # ═══ Polygon GLD ETF (يحتاج Stocks plan) ═══
+        msg += "*3️⃣ Polygon — GLD ETF Snapshot:*\n"
+        if not POLYGON_API_KEY:
+            msg += "   ❌ غير متاح\n\n"
+        else:
+            data = polygon_get(
+                "/v2/snapshot/locale/us/markets/stocks/tickers/GLD",
+                return_error=True,
+            )
+            if isinstance(data, dict) and data.get("_error"):
+                msg += f"   ❌ {data.get('_message', 'فشل')}\n\n"
+            elif data and data.get("status") == "OK" and data.get("ticker"):
+                td = data["ticker"]
+                last_trade = td.get("lastTrade", {}) or {}
+                gld_p = last_trade.get("p", 0)
+                if gld_p:
+                    estimated = gld_p * 10
+                    msg += f"   ✅ GLD: `${gld_p:.2f}` → الذهب ≈ `${estimated:,.2f}`\n\n"
+                else:
+                    msg += "   ⚠️ بيانات GLD فارغة\n\n"
+            else:
+                msg += "   ⚠️ لا يوجد رد\n\n"
+        
+        # ═══ yfinance GC=F ═══
+        msg += "*4️⃣ yfinance (GC=F):*\n"
+        try:
+            t = yf.Ticker("GC=F")
+            hist = t.history(period="1d", interval="1m")
+            if not hist.empty:
+                yf_p = float(hist["Close"].iloc[-1])
+                msg += f"   📊 السعر: `${yf_p:,.2f}`\n"
+                if yf_p < 3000:
+                    msg += f"   ⚠️ يبدو contract منتهي (السعر الحقيقي >$4000)\n"
+                msg += "\n"
+            else:
+                msg += "   ❌ بيانات فارغة\n\n"
+        except Exception as e:
+            msg += f"   ❌ خطأ: {str(e)[:50]}\n\n"
+        
+        # ═══ القرار النهائي ═══
+        poly = polygon_get_gold_price()
+        msg += "━━━━━━━━━━━━━━━━━━━\n"
+        msg += "*🎯 السعر اللي يستخدمه البوت:*\n"
+        if poly:
+            msg += f"`${poly['price']:,.2f}`\n"
+            msg += f"_المصدر: {poly.get('source', 'unknown')}_\n"
+        else:
+            msg += "⚠️ كل مصادر Polygon فشلت → fallback لـyfinance\n"
+            msg += "_قد يكون الرقم غير دقيق_\n"
+        
+        await send_long(u, msg)
+        return
+    
         if not ENABLE_OPTIONS:
             await u.message.reply_text(
                 "💎 *Options Sentiment معطّلة*\n"
@@ -2415,10 +2791,31 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
             # جلب TA + DataFrame
             ta_ticker = "GC=F" if asset == "Gold" else "DX-Y.NYB"
             ta_full = technical_analysis(ta_ticker)
-            t = yf.Ticker(ta_ticker)
-            df_daily = t.history(period="6mo", interval="1d")
             
-            if not ta_full or df_daily.empty:
+            # للذهب: استخدم scaled DataFrame
+            if asset == "Gold":
+                df_daily, scale_info = get_gold_dataframe_scaled(period="6mo", interval="1d")
+                if df_daily is None or df_daily.empty:
+                    t = yf.Ticker(ta_ticker)
+                    df_daily = t.history(period="6mo", interval="1d")
+                # تنبيه المستخدم لو يستخدم سعر مختلف عن السعر الحالي
+                if scale_info.get("applied"):
+                    poly_price = scale_info.get("poly_price", 0)
+                    diff_from_entry = abs(entry_input - poly_price) / poly_price * 100 if poly_price else 0
+                    if diff_from_entry > 10:
+                        await u.message.reply_text(
+                            f"⚠️ *تنبيه:* السعر الحالي للذهب من Polygon هو "
+                            f"`${poly_price:,.2f}`\n"
+                            f"إنت دخلت entry = `${entry_input:,.2f}` "
+                            f"(فرق {diff_from_entry:.1f}%)\n\n"
+                            f"_ممكن تستخدم سعر قريب من السعر الحالي_",
+                            parse_mode="Markdown"
+                        )
+            else:
+                t = yf.Ticker(ta_ticker)
+                df_daily = t.history(period="6mo", interval="1d")
+            
+            if not ta_full or df_daily is None or df_daily.empty:
                 await u.message.reply_text("⚠️ تعذّر جلب البيانات الفنية")
                 return
             
