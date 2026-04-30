@@ -28,12 +28,24 @@ import numpy as np
 # ═══════════════════════════════════════════════════════════════════════
 ASSET_CONFIG = {
     "Gold": {
-        "pip_value": 0.10,         # 1 pip = $0.10 per 0.01 lot
-        "round_levels": [10, 25, 50, 100],   # round numbers spacing
-        "min_distance": 5.0,        # min SL distance in price
+        "pip_value": 0.10,
+        "round_levels": [10, 25, 50, 100],
+        "min_distance": 5.0,
         "default_atr_mult": 1.5,
         "decimals": 2,
         "symbol": "$",
+        "lot_value_per_point": 100,  # Gold: 1 lot = 100 oz
+        "min_lot": 0.01,
+    },
+    "Silver": {
+        "pip_value": 0.05,
+        "round_levels": [0.50, 1.0, 2.5, 5.0],
+        "min_distance": 0.30,
+        "default_atr_mult": 1.5,
+        "decimals": 3,
+        "symbol": "$",
+        "lot_value_per_point": 5000,  # Silver: 1 lot = 5000 oz
+        "min_lot": 0.01,
     },
     "USD/DXY": {
         "pip_value": 1.0,
@@ -42,6 +54,8 @@ ASSET_CONFIG = {
         "default_atr_mult": 1.5,
         "decimals": 3,
         "symbol": "",
+        "lot_value_per_point": 1000,
+        "min_lot": 0.01,
     },
     "EUR/USD": {
         "pip_value": 10.0,
@@ -50,6 +64,58 @@ ASSET_CONFIG = {
         "default_atr_mult": 1.5,
         "decimals": 5,
         "symbol": "",
+        "lot_value_per_point": 100000,  # 1 standard lot = 100k units
+        "min_lot": 0.01,
+    },
+    "GBP/USD": {
+        "pip_value": 10.0,
+        "round_levels": [0.0050, 0.0100],
+        "min_distance": 0.0010,
+        "default_atr_mult": 1.5,
+        "decimals": 5,
+        "symbol": "",
+        "lot_value_per_point": 100000,
+        "min_lot": 0.01,
+    },
+    "USD/JPY": {
+        "pip_value": 9.0,    # تقريبي - يعتمد على الصرف
+        "round_levels": [0.50, 1.00, 5.00],
+        "min_distance": 0.10,
+        "default_atr_mult": 1.5,
+        "decimals": 3,
+        "symbol": "¥",
+        "lot_value_per_point": 1000,
+        "min_lot": 0.01,
+    },
+    "USD/CHF": {
+        "pip_value": 10.0,
+        "round_levels": [0.0050, 0.0100],
+        "min_distance": 0.0010,
+        "default_atr_mult": 1.5,
+        "decimals": 5,
+        "symbol": "",
+        "lot_value_per_point": 100000,
+        "min_lot": 0.01,
+    },
+    "AUD/USD": {
+        "pip_value": 10.0,
+        "round_levels": [0.0050, 0.0100],
+        "min_distance": 0.0010,
+        "default_atr_mult": 1.5,
+        "decimals": 5,
+        "symbol": "",
+        "lot_value_per_point": 100000,
+        "min_lot": 0.01,
+    },
+    "Oil": {
+        "pip_value": 10.0,
+        "round_levels": [0.50, 1.0, 5.0, 10.0],
+        "min_distance": 0.30,
+        "default_atr_mult": 1.5,
+        "decimals": 2,
+        "symbol": "$",
+        "lot_value_per_point": 1000,  # WTI: 1 contract = 1000 barrels
+        "min_lot": 0.01,
     },
     "default": {
         "pip_value": 1.0,
@@ -58,6 +124,8 @@ ASSET_CONFIG = {
         "default_atr_mult": 1.5,
         "decimals": 2,
         "symbol": "",
+        "lot_value_per_point": 100,
+        "min_lot": 0.01,
     },
 }
 
@@ -227,6 +295,346 @@ def find_equal_highs_lows(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 2.5) LIQUIDITY POOLS DETECTION — منطق الحيتان (Smart Money Logic)
+# ═══════════════════════════════════════════════════════════════════════
+def find_liquidity_pools(
+    df: pd.DataFrame,
+    asset: str = "Gold",
+    lookback_swings: int = 5,
+) -> Dict[str, List[Dict]]:
+    """يحدد Liquidity Pools — الأماكن اللي الحيتان بتستهدفها.
+    
+    الفلسفة:
+    ==========
+    Smart Money (المؤسسات/الحيتان) بتشتغل على الـSell-side & Buy-side Liquidity:
+    
+    🐋 Buy-side Liquidity (BSL): فوق Swing Highs / Equal Highs
+       - هنا الـShort traders بيحطوا Stop Loss (Buy Stops)
+       - الحيتان بتدفع السعر لفوق علشان تـsweep هذي الـstops
+       - بعد الـsweep، السعر يرجع تحت = "Stop Hunt"
+    
+    🐋 Sell-side Liquidity (SSL): تحت Swing Lows / Equal Lows
+       - هنا الـLong traders بيحطوا Stop Loss (Sell Stops)
+       - الحيتان بتـsweep هذي الـstops قبل ما تعكس
+    
+    استراتيجية البوت:
+    ================
+    1. SL: لازم يكون **بعد** الـliquidity pool (مش قبله)
+       لأن الحيتان بتمسح الـliquidity وترجع
+    2. TP: في اتجاه الـopposite liquidity pool
+       (الحيتان بتدفع السعر لهناك)
+    
+    Returns:
+        {
+          "buy_side": [   # فوق السعر - target للـlongs
+              {"price": x, "type": "Equal Highs", "strength": "very_strong",
+               "touches": 3, "distance_pct": 1.2, "is_swept": False},
+              ...
+          ],
+          "sell_side": [  # تحت السعر - target للـshorts
+              ...
+          ]
+        }
+    """
+    if df.empty or len(df) < 30:
+        return {"buy_side": [], "sell_side": []}
+    
+    cfg = _get_config(asset)
+    current_price = float(df["Close"].iloc[-1])
+    
+    buy_side = []
+    sell_side = []
+    
+    # ═══ المصدر 1: Equal Highs/Lows (الأقوى) ═══
+    eq_data = find_equal_highs_lows(df, tolerance_pct=0.0015, min_touches=2)
+    
+    for eq in eq_data["equal_highs"]:
+        if eq["price"] > current_price:
+            distance_pct = (eq["price"] - current_price) / current_price * 100
+            strength_label = (
+                "very_strong" if eq["touches"] >= 3
+                else "strong" if eq["touches"] == 2
+                else "medium"
+            )
+            buy_side.append({
+                "price": eq["price"],
+                "type": f"Equal Highs ({eq['touches']}× touches)",
+                "icon": "🎯",
+                "strength": strength_label,
+                "touches": eq["touches"],
+                "distance_pct": round(distance_pct, 3),
+                "source": "equal_highs",
+                "is_swept": False,  # سيتم تحديده لاحقاً
+            })
+    
+    for eq in eq_data["equal_lows"]:
+        if eq["price"] < current_price:
+            distance_pct = (current_price - eq["price"]) / current_price * 100
+            strength_label = (
+                "very_strong" if eq["touches"] >= 3
+                else "strong" if eq["touches"] == 2
+                else "medium"
+            )
+            sell_side.append({
+                "price": eq["price"],
+                "type": f"Equal Lows ({eq['touches']}× touches)",
+                "icon": "🎯",
+                "strength": strength_label,
+                "touches": eq["touches"],
+                "distance_pct": round(distance_pct, 3),
+                "source": "equal_lows",
+                "is_swept": False,
+            })
+    
+    # ═══ المصدر 2: Recent Swing Highs/Lows (المهمة) ═══
+    swings = find_swing_points(df, lookback=lookback_swings)
+    
+    # نأخذ آخر 5 swings فقط (الأقرب زمنياً = الأكثر تأثيراً)
+    recent_highs = sorted(swings["highs"], key=lambda x: -x["index"])[:5]
+    recent_lows = sorted(swings["lows"], key=lambda x: -x["index"])[:5]
+    
+    for sh in recent_highs:
+        if sh["price"] > current_price:
+            distance_pct = (sh["price"] - current_price) / current_price * 100
+            # Strength بناءً على bars_ago — كل ما كانت أحدث، أقوى
+            strength_label = (
+                "very_strong" if sh["bars_ago"] < 20
+                else "strong" if sh["bars_ago"] < 60
+                else "medium"
+            )
+            buy_side.append({
+                "price": round(sh["price"], cfg["decimals"]),
+                "type": f"Swing High ({sh['bars_ago']} bars ago)",
+                "icon": "🔝",
+                "strength": strength_label,
+                "bars_ago": sh["bars_ago"],
+                "distance_pct": round(distance_pct, 3),
+                "source": "swing_high",
+                "is_swept": False,
+            })
+    
+    for sl in recent_lows:
+        if sl["price"] < current_price:
+            distance_pct = (current_price - sl["price"]) / current_price * 100
+            strength_label = (
+                "very_strong" if sl["bars_ago"] < 20
+                else "strong" if sl["bars_ago"] < 60
+                else "medium"
+            )
+            sell_side.append({
+                "price": round(sl["price"], cfg["decimals"]),
+                "type": f"Swing Low ({sl['bars_ago']} bars ago)",
+                "icon": "🔻",
+                "strength": strength_label,
+                "bars_ago": sl["bars_ago"],
+                "distance_pct": round(distance_pct, 3),
+                "source": "swing_low",
+                "is_swept": False,
+            })
+    
+    # ═══ المصدر 3: All-Time/Period High & Low ═══
+    period_high = float(df["High"].max())
+    period_low = float(df["Low"].min())
+    
+    if period_high > current_price:
+        distance_pct = (period_high - current_price) / current_price * 100
+        if distance_pct < 25:  # عقلانياً
+            buy_side.append({
+                "price": round(period_high, cfg["decimals"]),
+                "type": "Period High (6mo)",
+                "icon": "👑",
+                "strength": "very_strong",
+                "distance_pct": round(distance_pct, 3),
+                "source": "period_high",
+                "is_swept": False,
+            })
+    
+    if period_low < current_price:
+        distance_pct = (current_price - period_low) / current_price * 100
+        if distance_pct < 25:
+            sell_side.append({
+                "price": round(period_low, cfg["decimals"]),
+                "type": "Period Low (6mo)",
+                "icon": "👑",
+                "strength": "very_strong",
+                "distance_pct": round(distance_pct, 3),
+                "source": "period_low",
+                "is_swept": False,
+            })
+    
+    # ═══ تحديد الـSwept Pools (الـliquidity اللي اتمسحت) ═══
+    # لو السعر اخترق pool ثم رجع = "Liquidity Sweep" حصل
+    # هذا مهم لأن الـpool الـswept = ضعيف (الحيتان مسحته بالفعل)
+    last_20_high = float(df["High"].iloc[-20:].max())
+    last_20_low = float(df["Low"].iloc[-20:].min())
+    
+    for p in buy_side:
+        # لو الـpool أقل من last_20_high والسعر دلوقتي تحته = اتمسح
+        if p["price"] < last_20_high and current_price < p["price"]:
+            # تأكد من إن السعر فعلاً اخترقه ورجع
+            for i in range(max(0, len(df) - 20), len(df)):
+                if df["High"].iloc[i] >= p["price"]:
+                    if df["Close"].iloc[-1] < p["price"]:
+                        p["is_swept"] = True
+                    break
+    
+    for p in sell_side:
+        if p["price"] > last_20_low and current_price > p["price"]:
+            for i in range(max(0, len(df) - 20), len(df)):
+                if df["Low"].iloc[i] <= p["price"]:
+                    if df["Close"].iloc[-1] > p["price"]:
+                        p["is_swept"] = True
+                    break
+    
+    # ═══ ترتيب وإزالة المكررات ═══
+    def dedupe_and_sort(pools: List[Dict]) -> List[Dict]:
+        # إزالة المكررات (نفس السعر تقريباً)
+        unique = []
+        seen_prices = []
+        for p in sorted(pools, key=lambda x: -_strength_score(x["strength"])):
+            is_dup = any(
+                abs(p["price"] - sp) / sp < 0.002 for sp in seen_prices
+            )
+            if not is_dup:
+                unique.append(p)
+                seen_prices.append(p["price"])
+        # ترتيب حسب القرب
+        unique.sort(key=lambda x: x["distance_pct"])
+        return unique[:8]  # أفضل 8 fقط
+    
+    return {
+        "buy_side": dedupe_and_sort(buy_side),
+        "sell_side": dedupe_and_sort(sell_side),
+    }
+
+
+def _strength_score(strength: str) -> int:
+    return {"very_strong": 4, "strong": 3, "medium": 2, "weak": 1}.get(strength, 0)
+
+
+def find_smart_money_zones(
+    df: pd.DataFrame,
+    asset: str = "Gold",
+) -> Dict[str, List[Dict]]:
+    """يحدد Smart Money Zones — مناطق دخول/خروج المؤسسات.
+    
+    1. **Order Blocks (OB)**: آخر شمعة مخالفة قبل حركة قوية
+       - Bullish OB: شمعة هابطة قبل ارتفاع كبير = الحيتان دخلت Long
+       - Bearish OB: شمعة صاعدة قبل هبوط كبير = الحيتان دخلت Short
+    
+    2. **Break of Structure (BOS)**: اختراق Swing High/Low كبير
+       - يدل على change of trend أو continuation
+    
+    3. **Mitigation Zones**: مناطق Order Blocks اللي تم إعادة اختبارها
+    
+    Returns:
+        {
+          "bullish_obs": [{"price": x, "type": "Bullish OB", ...}],
+          "bearish_obs": [...],
+          "recent_bos": [{"price": x, "type": "Bullish BOS", ...}],
+        }
+    """
+    if df.empty or len(df) < 30:
+        return {"bullish_obs": [], "bearish_obs": [], "recent_bos": []}
+    
+    cfg = _get_config(asset)
+    bullish_obs = []
+    bearish_obs = []
+    recent_bos = []
+    
+    n = len(df)
+    
+    # ═══ Order Blocks Detection ═══
+    # نبحث في آخر 60 شمعة عن OBs
+    for i in range(max(0, n - 60), n - 3):
+        candle_open = df["Open"].iloc[i]
+        candle_close = df["Close"].iloc[i]
+        candle_high = df["High"].iloc[i]
+        candle_low = df["Low"].iloc[i]
+        candle_range = candle_high - candle_low
+        
+        if candle_range == 0:
+            continue
+        
+        # شمعة هابطة (close < open)
+        is_bearish = candle_close < candle_open
+        # شمعة صاعدة
+        is_bullish = candle_close > candle_open
+        
+        # Bullish OB: شمعة هابطة، تليها 2-3 شموع صاعدة قوية
+        if is_bearish and i + 3 < n:
+            next_3_high = max(df["High"].iloc[i+1:i+4])
+            move_up = (next_3_high - candle_high) / candle_range
+            if move_up > 2.0:  # ارتفاع 2x range الشمعة
+                bullish_obs.append({
+                    "price": round((candle_high + candle_low) / 2, cfg["decimals"]),
+                    "high": round(candle_high, cfg["decimals"]),
+                    "low": round(candle_low, cfg["decimals"]),
+                    "type": "Bullish OB",
+                    "icon": "🟢",
+                    "bars_ago": n - 1 - i,
+                    "move_strength": round(move_up, 2),
+                    "strength": "very_strong" if move_up > 3 else "strong",
+                })
+        
+        # Bearish OB: شمعة صاعدة، تليها 2-3 شموع هابطة قوية
+        if is_bullish and i + 3 < n:
+            next_3_low = min(df["Low"].iloc[i+1:i+4])
+            move_down = (candle_low - next_3_low) / candle_range
+            if move_down > 2.0:
+                bearish_obs.append({
+                    "price": round((candle_high + candle_low) / 2, cfg["decimals"]),
+                    "high": round(candle_high, cfg["decimals"]),
+                    "low": round(candle_low, cfg["decimals"]),
+                    "type": "Bearish OB",
+                    "icon": "🔴",
+                    "bars_ago": n - 1 - i,
+                    "move_strength": round(move_down, 2),
+                    "strength": "very_strong" if move_down > 3 else "strong",
+                })
+    
+    # ترتيب: الأقرب والأقوى أولاً
+    bullish_obs.sort(key=lambda x: (x["bars_ago"], -_strength_score(x["strength"])))
+    bearish_obs.sort(key=lambda x: (x["bars_ago"], -_strength_score(x["strength"])))
+    
+    # ═══ Break of Structure Detection ═══
+    # نشوف هل آخر 10 شموع كسرت آخر Swing High/Low
+    swings = find_swing_points(df, lookback=5)
+    if swings["highs"] and swings["lows"]:
+        last_swing_high = max(swings["highs"], key=lambda x: x["index"]) if swings["highs"] else None
+        last_swing_low = max(swings["lows"], key=lambda x: x["index"]) if swings["lows"] else None
+        
+        recent_close = float(df["Close"].iloc[-1])
+        
+        if last_swing_high and recent_close > last_swing_high["price"]:
+            # Bullish BOS — اختراق صعودي
+            recent_bos.append({
+                "price": round(last_swing_high["price"], cfg["decimals"]),
+                "type": "Bullish BOS",
+                "icon": "⚡",
+                "direction": "up",
+                "bars_ago": last_swing_high["bars_ago"],
+                "strength": "strong",
+            })
+        
+        if last_swing_low and recent_close < last_swing_low["price"]:
+            recent_bos.append({
+                "price": round(last_swing_low["price"], cfg["decimals"]),
+                "type": "Bearish BOS",
+                "icon": "⚡",
+                "direction": "down",
+                "bars_ago": last_swing_low["bars_ago"],
+                "strength": "strong",
+            })
+    
+    return {
+        "bullish_obs": bullish_obs[:5],
+        "bearish_obs": bearish_obs[:5],
+        "recent_bos": recent_bos,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 3) LIQUIDITY MAP — كل المستويات في مكان واحد
 # ═══════════════════════════════════════════════════════════════════════
 def build_liquidity_map(
@@ -385,14 +793,94 @@ def build_liquidity_map(
             "distance_pct": (price - ta["bb_lower"]) / price * 100,
         })
     
+    # 7. ⭐ Liquidity Pools (الحيتان) - الأقوى
+    liq_pools = find_liquidity_pools(df, asset)
+    
+    # Buy-side liquidity (فوق السعر) = هدف للـlongs
+    for pool in liq_pools["buy_side"]:
+        if pool.get("is_swept"):
+            continue  # نتخطى الـpools اللي اتمسحت
+        levels_above.append({
+            "price": pool["price"],
+            "type": f"💰 BSL: {pool['type']}",
+            "icon": pool["icon"],
+            "strength": pool["strength"],
+            "distance_pct": pool["distance_pct"],
+            "is_liquidity_pool": True,
+            "pool_source": pool.get("source"),
+        })
+    
+    # Sell-side liquidity (تحت السعر) = هدف للـshorts
+    for pool in liq_pools["sell_side"]:
+        if pool.get("is_swept"):
+            continue
+        levels_below.append({
+            "price": pool["price"],
+            "type": f"💰 SSL: {pool['type']}",
+            "icon": pool["icon"],
+            "strength": pool["strength"],
+            "distance_pct": pool["distance_pct"],
+            "is_liquidity_pool": True,
+            "pool_source": pool.get("source"),
+        })
+    
+    # 8. ⭐ Smart Money Zones (Order Blocks المحسّنة + BOS)
+    sm_zones = find_smart_money_zones(df, asset)
+    
+    for ob in sm_zones["bullish_obs"][:3]:
+        if ob["price"] < price:
+            levels_below.append({
+                "price": ob["price"],
+                "type": f"🐋 {ob['type']} ({ob['bars_ago']}b ago)",
+                "icon": ob["icon"],
+                "strength": ob["strength"],
+                "distance_pct": (price - ob["price"]) / price * 100,
+                "is_smart_money_zone": True,
+                "ob_high": ob["high"],
+                "ob_low": ob["low"],
+            })
+        else:
+            levels_above.append({
+                "price": ob["price"],
+                "type": f"🐋 {ob['type']} ({ob['bars_ago']}b ago)",
+                "icon": ob["icon"],
+                "strength": ob["strength"],
+                "distance_pct": (ob["price"] - price) / price * 100,
+                "is_smart_money_zone": True,
+            })
+    
+    for ob in sm_zones["bearish_obs"][:3]:
+        if ob["price"] > price:
+            levels_above.append({
+                "price": ob["price"],
+                "type": f"🐋 {ob['type']} ({ob['bars_ago']}b ago)",
+                "icon": ob["icon"],
+                "strength": ob["strength"],
+                "distance_pct": (ob["price"] - price) / price * 100,
+                "is_smart_money_zone": True,
+                "ob_high": ob["high"],
+                "ob_low": ob["low"],
+            })
+        else:
+            levels_below.append({
+                "price": ob["price"],
+                "type": f"🐋 {ob['type']} ({ob['bars_ago']}b ago)",
+                "icon": ob["icon"],
+                "strength": ob["strength"],
+                "distance_pct": (price - ob["price"]) / price * 100,
+                "is_smart_money_zone": True,
+            })
+    
     # ترتيب حسب القرب من السعر
     levels_above.sort(key=lambda x: x["distance_pct"])
     levels_below.sort(key=lambda x: x["distance_pct"])
     
     return {
-        "above": levels_above[:10],
-        "below": levels_below[:10],
+        "above": levels_above[:12],
+        "below": levels_below[:12],
         "current_price": price,
+        "liquidity_pools": liq_pools,
+        "smart_money_zones": sm_zones,
     }
 
 
@@ -425,73 +913,133 @@ def calculate_smart_sl(
     # ─── المرجع: المستويات في الاتجاه المعاكس للصفقة ───
     reference_levels = liq_map["below"] if is_buy else liq_map["above"]
     
+    # ⭐ Liquidity Pools (الحيتان) في الاتجاه المعاكس
+    liq_pools = liq_map.get("liquidity_pools", {})
+    if is_buy:
+        opposite_pools = liq_pools.get("sell_side", [])  # SSL تحت السعر
+    else:
+        opposite_pools = liq_pools.get("buy_side", [])   # BSL فوق السعر
+    
+    # نأخذ الـpools اللي مش متمسحة (الحيتان لسه ممكن تستهدفها)
+    active_pools = [p for p in opposite_pools if not p.get("is_swept", False)]
+    
     # ═══ Conservative SL (الأكثر أماناً) ═══
+    # المنطق: SL **خلف** أقوى Liquidity Pool
+    # عشان لو الحيتان مسحت الـpool، ما يضربش الـSL بتاعنا
     cons_sl = None
     cons_logic = []
-    max_distance_cons = atr * 4  # حد أقصى أوسع للـconservative
+    max_distance_cons = atr * 5  # حد أقصى أوسع للـconservative
     
-    # ابحث عن أقرب OB قوي في النطاق
-    ob_candidates = [
-        l for l in reference_levels
-        if l["strength"] in ("strong", "very_strong")
-        and "OB" in l["type"]
-        and abs(l["price"] - entry) <= max_distance_cons
+    # نبحث في active_pools عن الأقوى والأقرب
+    strong_pools = [
+        p for p in active_pools
+        if p["strength"] in ("very_strong", "strong")
+        and abs(p["price"] - entry) <= max_distance_cons
     ]
-    ob_candidates.sort(key=lambda x: abs(x["price"] - entry))
+    strong_pools.sort(key=lambda x: abs(x["price"] - entry))
     
-    for lvl in ob_candidates:
-        buffer = atr * 0.5
+    if strong_pools:
+        target_pool = strong_pools[0]
+        # buffer أكبر للـConservative (atr × 0.7) عشان يكون **بعد** الـpool
+        buffer = atr * 0.7
         if is_buy:
-            candidate = lvl["price"] - buffer
-            if candidate < entry:
-                cons_sl = candidate
-                cons_logic.append(f"ورا {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
-                cons_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.5)")
-                break
+            cons_sl = target_pool["price"] - buffer
+            cons_logic.append(f"🐋 خلف {target_pool['type']} @ {target_pool['price']:.{cfg['decimals']}f}")
+            cons_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.7)")
+            cons_logic.append("✓ مكان حماية من Stop Hunting")
         else:
-            candidate = lvl["price"] + buffer
-            if candidate > entry:
-                cons_sl = candidate
-                cons_logic.append(f"ورا {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
-                cons_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.5)")
-                break
+            cons_sl = target_pool["price"] + buffer
+            cons_logic.append(f"🐋 خلف {target_pool['type']} @ {target_pool['price']:.{cfg['decimals']}f}")
+            cons_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.7)")
+            cons_logic.append("✓ مكان حماية من Stop Hunting")
     
-    # Fallback: لو ما لقيناش OB قريب
+    # Fallback 1: Order Block قوي
+    if cons_sl is None:
+        ob_candidates = [
+            l for l in reference_levels
+            if l["strength"] in ("strong", "very_strong")
+            and "OB" in l["type"]
+            and abs(l["price"] - entry) <= max_distance_cons
+        ]
+        ob_candidates.sort(key=lambda x: abs(x["price"] - entry))
+        
+        for lvl in ob_candidates:
+            buffer = atr * 0.5
+            if is_buy:
+                candidate = lvl["price"] - buffer
+                if candidate < entry:
+                    cons_sl = candidate
+                    cons_logic.append(f"ورا {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
+                    cons_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.5)")
+                    break
+            else:
+                candidate = lvl["price"] + buffer
+                if candidate > entry:
+                    cons_sl = candidate
+                    cons_logic.append(f"ورا {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
+                    cons_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.5)")
+                    break
+    
+    # Fallback 2: ATR × 2.5
     if cons_sl is None:
         mult = 2.5
         cons_sl = entry - atr * mult if is_buy else entry + atr * mult
-        cons_logic.append(f"ATR × {mult} (لا يوجد OB قريب)")
+        cons_logic.append(f"ATR × {mult} (لا يوجد Liquidity Pool قريب)")
     
-    # ═══ Balanced SL (متوازن) ═══
-    # الأقرب: أقرب Swing Point في النطاق المعقول (مش أبعد من 3× ATR)
+    # ═══ Balanced SL (متوازن) - بعد أقرب Swing/Pool ═══
+    # المنطق: SL خلف أقرب Liquidity Pool متوسط القوة
     bal_sl = None
     bal_logic = []
-    max_distance = atr * 3  # حد أقصى للمسافة
+    max_distance = atr * 3
     
-    swing_candidates = [
-        l for l in reference_levels
-        if "Swing" in l["type"] and abs(l["price"] - entry) <= max_distance
+    # نأخذ medium-strength pools كأولوية
+    medium_pools = [
+        p for p in active_pools
+        if p["strength"] in ("strong", "medium")
+        and abs(p["price"] - entry) <= max_distance
     ]
-    # ترتيب حسب القرب من entry (الأقرب أولاً)
-    swing_candidates.sort(key=lambda x: abs(x["price"] - entry))
+    medium_pools.sort(key=lambda x: abs(x["price"] - entry))
     
-    for lvl in swing_candidates:
-        buffer = atr * 0.3
+    if medium_pools:
+        target = medium_pools[0]
+        buffer = atr * 0.4
         if is_buy:
-            candidate = lvl["price"] - buffer
-            # تأكد إنه أبعد من Conservative بشكل منطقي
-            if candidate < entry and (cons_sl is None or candidate > cons_sl - atr * 0.5):
+            candidate = target["price"] - buffer
+            if candidate < entry and (cons_sl is None or candidate > cons_sl - atr * 0.3):
                 bal_sl = candidate
-                bal_logic.append(f"ورا {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
-                bal_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.3)")
-                break
+                bal_logic.append(f"💰 خلف {target['type']} @ {target['price']:.{cfg['decimals']}f}")
+                bal_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.4)")
         else:
-            candidate = lvl["price"] + buffer
-            if candidate > entry and (cons_sl is None or candidate < cons_sl + atr * 0.5):
+            candidate = target["price"] + buffer
+            if candidate > entry and (cons_sl is None or candidate < cons_sl + atr * 0.3):
                 bal_sl = candidate
-                bal_logic.append(f"ورا {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
-                bal_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.3)")
-                break
+                bal_logic.append(f"💰 خلف {target['type']} @ {target['price']:.{cfg['decimals']}f}")
+                bal_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.4)")
+    
+    # Fallback: Swing point
+    if bal_sl is None:
+        swing_candidates = [
+            l for l in reference_levels
+            if "Swing" in l["type"] and abs(l["price"] - entry) <= max_distance
+        ]
+        swing_candidates.sort(key=lambda x: abs(x["price"] - entry))
+        
+        for lvl in swing_candidates:
+            buffer = atr * 0.3
+            if is_buy:
+                candidate = lvl["price"] - buffer
+                if candidate < entry and (cons_sl is None or candidate > cons_sl - atr * 0.5):
+                    bal_sl = candidate
+                    bal_logic.append(f"ورا {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
+                    bal_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.3)")
+                    break
+            else:
+                candidate = lvl["price"] + buffer
+                if candidate > entry and (cons_sl is None or candidate < cons_sl + atr * 0.5):
+                    bal_sl = candidate
+                    bal_logic.append(f"ورا {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
+                    bal_logic.append(f"Buffer: {buffer:.{cfg['decimals']}f} (ATR × 0.3)")
+                    break
     
     # Fallback: ATR × 1.5
     if bal_sl is None:
@@ -571,68 +1119,141 @@ def calculate_smart_tp(
     # المستويات في اتجاه الصفقة
     target_levels = liq_map["above"] if is_buy else liq_map["below"]
     
-    # ═══ TP1: Conservative (سريع) ═══
+    # ⭐ Liquidity Pools في اتجاه الصفقة (الحيتان بتدفع السعر هناك)
+    liq_pools = liq_map.get("liquidity_pools", {})
+    if is_buy:
+        target_pools = liq_pools.get("buy_side", [])  # BSL فوق
+    else:
+        target_pools = liq_pools.get("sell_side", [])  # SSL تحت
+    
+    # نأخذ الـpools الـactive (مش متمسحة) — الحيتان لسه ممكن تستهدفها
+    active_target_pools = [p for p in target_pools if not p.get("is_swept", False)]
+    
+    # ═══ TP1: Conservative (سريع - أقرب liquidity pool) ═══
     tp1 = None
     tp1_logic = []
     
-    # أقرب Swing Point أو OB في الاتجاه
-    for lvl in target_levels:
-        if lvl["distance_pct"] < 1.5 and lvl["strength"] in ("strong", "very_strong"):
-            tp1 = lvl["price"] * 0.998 if is_buy else lvl["price"] * 1.002  # قبله شوية
-            tp1_logic.append(f"قبل {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
-            break
+    # أولاً: نشوف هل في liquidity pool قريب (1-3% بعيد)
+    nearby_pools = [
+        p for p in active_target_pools
+        if 0.5 < p["distance_pct"] < 3.0
+        and p["strength"] in ("strong", "very_strong")
+    ]
     
-    # Fallback: 1× ATR
+    if nearby_pools:
+        target = nearby_pools[0]
+        # TP **قبل** الـpool عشان يخش قبل الـsweep
+        # نتحقق إن الـTP في الاتجاه الصحيح من الـentry
+        tp1_candidate = target["price"] * 0.998 if is_buy else target["price"] * 1.002
+        if (is_buy and tp1_candidate > entry) or (not is_buy and tp1_candidate < entry):
+            tp1 = tp1_candidate
+            tp1_logic.append(f"💰 قبل {target['type']} @ {target['price']:.{cfg['decimals']}f}")
+            tp1_logic.append("✓ هدف Smart Money — اقفل قبل الـsweep")
+    
+    # Fallback 1: أقرب Swing/OB في الاتجاه الصحيح
+    if tp1 is None:
+        for lvl in target_levels:
+            if lvl["distance_pct"] < 1.5 and lvl["strength"] in ("strong", "very_strong"):
+                tp1_candidate = lvl["price"] * 0.998 if is_buy else lvl["price"] * 1.002
+                # تحقق إن الـTP فوق الـentry للـbuy وتحت للـsell
+                if (is_buy and tp1_candidate > entry) or (not is_buy and tp1_candidate < entry):
+                    tp1 = tp1_candidate
+                    tp1_logic.append(f"قبل {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
+                    break
+    
+    # Fallback 2: 1.5× ATR (دائماً في الاتجاه الصحيح)
     if tp1 is None:
         atr = ta.get("atr", entry * 0.005)
         tp1 = entry + atr * 1.5 if is_buy else entry - atr * 1.5
         tp1_logic.append("1.5 × ATR (fallback)")
     
-    # ═══ TP2: Balanced (الهدف الأساسي - liquidity cluster) ═══
+    # ═══ TP2: Balanced (Liquidity Pool أبعد - الهدف الرئيسي) ═══
+    # المنطق: الحيتان بتدفع السعر لـliquidity pool أكبر
+    # ده هدف الصفقة الفعلي
     tp2 = None
     tp2_logic = []
     
-    # ابحث عن Equal Highs/Lows أو Liquidity Cluster كبير
-    for lvl in target_levels:
-        if (
-            ("Equal" in lvl["type"] or "Round" in lvl["type"])
-            and lvl["strength"] == "very_strong"
-            and lvl["distance_pct"] > 0.8
-        ):
-            tp2 = lvl["price"]
-            tp2_logic.append(f"عند {lvl['type']} (تجمّع stops) @ {lvl['price']:.{cfg['decimals']}f}")
-            break
+    # نأخذ very_strong pools في نطاق 3-8%
+    target_pools_mid = [
+        p for p in active_target_pools
+        if 2.0 < p["distance_pct"] < 8.0
+        and p["strength"] == "very_strong"
+    ]
     
-    # Fallback: استخدم أبعد strong level
+    if target_pools_mid:
+        target = target_pools_mid[0]
+        tp2_candidate = target["price"] * 0.998 if is_buy else target["price"] * 1.002
+        if (is_buy and tp2_candidate > entry) or (not is_buy and tp2_candidate < entry):
+            tp2 = tp2_candidate
+            tp2_logic.append(f"🎯 عند {target['type']}")
+            tp2_logic.append(f"💰 BSL/SSL Cluster @ {target['price']:.{cfg['decimals']}f}")
+            tp2_logic.append("✓ المكان اللي الحيتان بتدفع السعر له")
+    
+    # Fallback 1: Equal Highs/Lows أو Round Number قوي (في الاتجاه الصحيح)
     if tp2 is None:
-        strong_levels = [l for l in target_levels if l["strength"] in ("strong", "very_strong")]
+        for lvl in target_levels:
+            if (
+                ("Equal" in lvl["type"] or "Round" in lvl["type"] or "Period" in lvl["type"])
+                and lvl["strength"] == "very_strong"
+                and lvl["distance_pct"] > 0.8
+            ):
+                # تحقق من الاتجاه
+                if (is_buy and lvl["price"] > entry) or (not is_buy and lvl["price"] < entry):
+                    tp2 = lvl["price"]
+                    tp2_logic.append(f"عند {lvl['type']} (تجمّع stops) @ {lvl['price']:.{cfg['decimals']}f}")
+                    break
+    
+    # Fallback 2: أبعد strong level
+    if tp2 is None:
+        strong_levels = [
+            l for l in target_levels
+            if l["strength"] in ("strong", "very_strong")
+            and ((is_buy and l["price"] > entry) or (not is_buy and l["price"] < entry))
+        ]
         if len(strong_levels) >= 2:
             tp2 = strong_levels[1]["price"]
             tp2_logic.append(f"عند {strong_levels[1]['type']} @ {strong_levels[1]['price']:.{cfg['decimals']}f}")
         else:
-            # 2× R
             tp2 = entry + risk * 2.5 if is_buy else entry - risk * 2.5
             tp2_logic.append("R:R = 1:2.5 (محسوب)")
     
-    # ═══ TP3: Extended (الحلم) ═══
+    # ═══ TP3: Extended (Period High/Low أو Major BSL/SSL) ═══
     tp3 = None
     tp3_logic = []
     
-    # ابحث عن Round Number كبير أو أبعد Equal Highs (في نطاق 3-5× R)
+    # نطاق TP3: لا يتعدى 5× R
     max_tp3 = entry + risk * 5 if is_buy else entry - risk * 5
     
-    for lvl in target_levels:
-        if lvl["strength"] == "very_strong":
-            in_range = (
-                (is_buy and entry < lvl["price"] <= max_tp3 and lvl["price"] > tp2)
-                or (not is_buy and max_tp3 <= lvl["price"] < entry and lvl["price"] < tp2)
-            )
-            if in_range:
-                tp3 = lvl["price"]
-                tp3_logic.append(f"عند {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
-                break
+    # نبحث عن أبعد liquidity pool ضخم في النطاق
+    far_pools = [
+        p for p in active_target_pools
+        if p["strength"] == "very_strong"
+        and ((is_buy and entry < p["price"] <= max_tp3 and p["price"] > tp2)
+             or (not is_buy and max_tp3 <= p["price"] < entry and p["price"] < tp2))
+    ]
     
-    # Fallback: 3× R (مش 4)
+    if far_pools:
+        # Period High/Low أولاً (الأكثر liquidity)
+        period_pools = [p for p in far_pools if "Period" in p.get("type", "")]
+        target = period_pools[0] if period_pools else far_pools[-1]
+        tp3 = target["price"]
+        tp3_logic.append(f"🐋 {target['type']} @ {target['price']:.{cfg['decimals']}f}")
+        tp3_logic.append("✓ هدف ممتد - liquidity pool ضخم")
+    
+    # Fallback: أي very_strong level في النطاق
+    if tp3 is None:
+        for lvl in target_levels:
+            if lvl["strength"] == "very_strong":
+                in_range = (
+                    (is_buy and entry < lvl["price"] <= max_tp3 and lvl["price"] > tp2)
+                    or (not is_buy and max_tp3 <= lvl["price"] < entry and lvl["price"] < tp2)
+                )
+                if in_range:
+                    tp3 = lvl["price"]
+                    tp3_logic.append(f"عند {lvl['type']} @ {lvl['price']:.{cfg['decimals']}f}")
+                    break
+    
+    # Fallback: 3× R
     if tp3 is None:
         tp3 = entry + risk * 3 if is_buy else entry - risk * 3
         tp3_logic.append("R:R = 1:3 (هدف ممتد محسوب)")
@@ -982,6 +1603,75 @@ def format_smart_risk_advanced(risk_data: Dict, lang: str = "ar") -> str:
     out.append(f"📊 *{asset}*  |  {arrow}")
     out.append(f"💰 Entry: `{sym}{entry:,.{dp}f}`  |  ATR: `{atr:.{dp}f}`")
     out.append("")
+    
+    # ═══ SMART MONEY / LIQUIDITY POOLS SECTION ═══
+    liq_map = risk_data.get("liquidity_map", {})
+    liq_pools = liq_map.get("liquidity_pools", {})
+    sm_zones = liq_map.get("smart_money_zones", {})
+    
+    if liq_pools or sm_zones:
+        out.append("🐋 *SMART MONEY ANALYSIS*")
+        out.append("─" * 33)
+        
+        # Buy-side Liquidity (BSL) - أهداف الـlongs
+        bsl = [p for p in liq_pools.get("buy_side", []) if not p.get("is_swept")][:3]
+        if bsl:
+            out.append("📈 *Buy-side Liquidity (BSL):*")
+            out.append("_(فوق السعر - أماكن الـStops للـShorts)_")
+            for p in bsl:
+                bars = f" | {p.get('bars_ago')}b" if p.get('bars_ago') else ""
+                strength_icon = {"very_strong": "🔥", "strong": "💪", "medium": "✓"}.get(
+                    p["strength"], "·"
+                )
+                out.append(
+                    f"   {strength_icon} {p['icon']} `{sym}{p['price']:,.{dp}f}` "
+                    f"({p['type']}{bars})"
+                )
+            out.append("")
+        
+        # Sell-side Liquidity (SSL) - أهداف الـshorts
+        ssl = [p for p in liq_pools.get("sell_side", []) if not p.get("is_swept")][:3]
+        if ssl:
+            out.append("📉 *Sell-side Liquidity (SSL):*")
+            out.append("_(تحت السعر - أماكن الـStops للـLongs)_")
+            for p in ssl:
+                bars = f" | {p.get('bars_ago')}b" if p.get('bars_ago') else ""
+                strength_icon = {"very_strong": "🔥", "strong": "💪", "medium": "✓"}.get(
+                    p["strength"], "·"
+                )
+                out.append(
+                    f"   {strength_icon} {p['icon']} `{sym}{p['price']:,.{dp}f}` "
+                    f"({p['type']}{bars})"
+                )
+            out.append("")
+        
+        # Order Blocks (مناطق دخول الحيتان)
+        bull_obs = sm_zones.get("bullish_obs", [])[:2]
+        bear_obs = sm_zones.get("bearish_obs", [])[:2]
+        if bull_obs or bear_obs:
+            out.append("🐋 *Order Blocks (دخول الحيتان):*")
+            for ob in bull_obs:
+                out.append(
+                    f"   🟢 Bullish OB: `{sym}{ob['low']:,.{dp}f}` - "
+                    f"`{sym}{ob['high']:,.{dp}f}` ({ob['bars_ago']}b ago)"
+                )
+            for ob in bear_obs:
+                out.append(
+                    f"   🔴 Bearish OB: `{sym}{ob['low']:,.{dp}f}` - "
+                    f"`{sym}{ob['high']:,.{dp}f}` ({ob['bars_ago']}b ago)"
+                )
+            out.append("")
+        
+        # Break of Structure
+        bos = sm_zones.get("recent_bos", [])
+        if bos:
+            for b in bos:
+                direction_text = "صعود" if b["direction"] == "up" else "هبوط"
+                out.append(
+                    f"⚡ *{b['type']}*: اختراق {direction_text} لـ"
+                    f"`{sym}{b['price']:,.{dp}f}`"
+                )
+            out.append("")
     
     # ═══ SL SECTION ═══
     sl = risk_data["sl"]
