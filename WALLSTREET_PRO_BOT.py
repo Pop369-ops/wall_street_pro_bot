@@ -185,6 +185,80 @@ def db_init():
     c.execute("CREATE INDEX IF NOT EXISTS idx_mem_chat ON conversation_memory(chat_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_news_time ON seen_news(seen_at)")
     
+    # ═══ جدول الصفقات المتابَعة (Active Trade Tracking) ═══
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tracked_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            recommendation_id INTEGER,
+            asset TEXT NOT NULL,
+            action TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            sl REAL,
+            tp1 REAL,
+            tp2 REAL,
+            tp3 REAL,
+            position_size REAL,
+            capital_at_entry REAL,
+            status TEXT DEFAULT 'ACTIVE',
+            tp1_hit INTEGER DEFAULT 0,
+            tp2_hit INTEGER DEFAULT 0,
+            tp3_hit INTEGER DEFAULT 0,
+            sl_moved_to_be INTEGER DEFAULT 0,
+            partial_closed_pct REAL DEFAULT 0,
+            exit_price REAL,
+            exit_reason TEXT,
+            pnl_dollars REAL,
+            pnl_pct REAL,
+            opened_at TEXT,
+            closed_at TEXT,
+            last_alert_at TEXT,
+            last_check_at TEXT,
+            notes TEXT,
+            FOREIGN KEY (recommendation_id) REFERENCES recommendations(id)
+        )
+    """)
+    
+    # ═══ جدول التنبيهات (تجنب التكرار) ═══
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS trade_alerts_sent (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER NOT NULL,
+            alert_type TEXT NOT NULL,
+            sent_at TEXT,
+            FOREIGN KEY (trade_id) REFERENCES tracked_trades(id)
+        )
+    """)
+    
+    # ═══ جدول تتبع الأخبار العاجلة (User-level toggle) ═══
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS news_tracking (
+            chat_id TEXT PRIMARY KEY,
+            enabled INTEGER DEFAULT 1,
+            assets TEXT,                       -- comma-separated: Gold,EUR/USD,...
+            min_impact INTEGER DEFAULT 2,      -- 1=low, 2=medium, 3=high only
+            ai_analysis INTEGER DEFAULT 1,     -- include AI analysis
+            started_at TEXT,
+            last_alert_at TEXT
+        )
+    """)
+    
+    # ═══ جدول الأخبار اللي اتبعت (تجنب تكرار التحليل) ═══
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS news_alerts_sent (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            news_id TEXT NOT NULL,
+            sent_at TEXT,
+            UNIQUE(chat_id, news_id)
+        )
+    """)
+    
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tracked_chat ON tracked_trades(chat_id, status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tracked_status ON tracked_trades(status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_trade ON trade_alerts_sent(trade_id, alert_type)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_news_alerts_chat ON news_alerts_sent(chat_id)")
+    
     conn.commit()
     conn.close()
     log.info("Database initialized ✅")
@@ -207,6 +281,224 @@ def db_exec(query: str, params: tuple = (), fetch: str = None) -> Any:
             return c.lastrowid
     finally:
         conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1.5) TRADE TRACKING HELPERS — إدارة الصفقات المتابَعة
+# ═══════════════════════════════════════════════════════════════════════
+def track_create_trade(
+    chat_id: str,
+    asset: str,
+    action: str,
+    entry: float,
+    sl: float = None,
+    tp1: float = None,
+    tp2: float = None,
+    tp3: float = None,
+    position_size: float = None,
+    capital: float = 4000,
+    recommendation_id: int = None,
+    notes: str = None,
+) -> int:
+    """ينشئ صفقة جديدة للتتبع.
+    
+    Returns: trade_id
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    return db_exec(
+        """INSERT INTO tracked_trades 
+           (chat_id, recommendation_id, asset, action, entry_price,
+            sl, tp1, tp2, tp3, position_size, capital_at_entry,
+            status, opened_at, last_check_at, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)""",
+        (chat_id, recommendation_id, asset, action.upper(), entry,
+         sl, tp1, tp2, tp3, position_size, capital,
+         now, now, notes)
+    )
+
+
+def track_get_active_trades(chat_id: str = None) -> List[Dict]:
+    """يجلب كل الصفقات النشطة (لمستخدم معين أو الكل)."""
+    if chat_id:
+        rows = db_exec(
+            "SELECT * FROM tracked_trades WHERE status='ACTIVE' AND chat_id=? "
+            "ORDER BY opened_at DESC",
+            (chat_id,), fetch="all"
+        )
+    else:
+        rows = db_exec(
+            "SELECT * FROM tracked_trades WHERE status='ACTIVE' "
+            "ORDER BY opened_at DESC",
+            fetch="all"
+        )
+    return [dict(r) for r in (rows or [])]
+
+
+def track_get_trade(trade_id: int) -> Optional[Dict]:
+    """يجلب صفقة بالـID."""
+    row = db_exec(
+        "SELECT * FROM tracked_trades WHERE id=?",
+        (trade_id,), fetch="one"
+    )
+    return dict(row) if row else None
+
+
+def track_update_trade(trade_id: int, **kwargs) -> bool:
+    """يحدّث حقول صفقة. مثال: track_update_trade(5, tp1_hit=1)."""
+    if not kwargs:
+        return False
+    set_clause = ", ".join(f"{k}=?" for k in kwargs)
+    values = list(kwargs.values()) + [trade_id]
+    db_exec(
+        f"UPDATE tracked_trades SET {set_clause} WHERE id=?",
+        tuple(values)
+    )
+    return True
+
+
+def track_close_trade(
+    trade_id: int,
+    exit_price: float,
+    exit_reason: str,
+    pnl_dollars: float = None,
+    pnl_pct: float = None,
+) -> bool:
+    """إغلاق صفقة."""
+    now = datetime.now(timezone.utc).isoformat()
+    db_exec(
+        """UPDATE tracked_trades 
+           SET status='CLOSED', exit_price=?, exit_reason=?,
+               pnl_dollars=?, pnl_pct=?, closed_at=?
+           WHERE id=?""",
+        (exit_price, exit_reason, pnl_dollars, pnl_pct, now, trade_id)
+    )
+    return True
+
+
+def track_alert_was_sent(trade_id: int, alert_type: str) -> bool:
+    """يتحقق هل التنبيه ده اتبعت قبل كده."""
+    row = db_exec(
+        "SELECT 1 FROM trade_alerts_sent WHERE trade_id=? AND alert_type=? LIMIT 1",
+        (trade_id, alert_type), fetch="one"
+    )
+    return bool(row)
+
+
+def track_mark_alert_sent(trade_id: int, alert_type: str):
+    """يسجّل إرسال التنبيه."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        db_exec(
+            "INSERT INTO trade_alerts_sent (trade_id, alert_type, sent_at) VALUES (?, ?, ?)",
+            (trade_id, alert_type, now)
+        )
+    except Exception:
+        pass
+
+
+def track_calculate_pnl(trade: Dict, current_price: float) -> Tuple[float, float]:
+    """يحسب PnL الحالي (دولار + نسبة).
+    
+    Returns: (pnl_dollars, pnl_pct)
+    """
+    entry = trade["entry_price"]
+    is_buy = trade["action"] in ("BUY", "ADD")
+    pos_size = trade.get("position_size") or 0
+    
+    if is_buy:
+        pnl_pct = (current_price - entry) / entry * 100
+    else:
+        pnl_pct = (entry - current_price) / entry * 100
+    
+    # PnL بالدولار يعتمد على lot_value
+    if pos_size:
+        try:
+            cfg = smart_risk.ASSET_CONFIG.get(trade["asset"], smart_risk.ASSET_CONFIG["default"])
+            lot_value = cfg.get("lot_value_per_point", 100)
+            price_diff = abs(current_price - entry)
+            sign = 1 if (is_buy and current_price > entry) or (not is_buy and current_price < entry) else -1
+            pnl_dollars = sign * price_diff * lot_value * pos_size
+        except Exception:
+            pnl_dollars = pnl_pct * (trade.get("capital_at_entry", 4000) * 0.01)
+    else:
+        pnl_dollars = pnl_pct * (trade.get("capital_at_entry", 4000) * 0.01)
+    
+    return round(pnl_dollars, 2), round(pnl_pct, 3)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1.6) NEWS TRACKING HELPERS — تتبع الأخبار العاجلة
+# ═══════════════════════════════════════════════════════════════════════
+def news_tracking_enable(
+    chat_id: str,
+    assets: List[str] = None,
+    min_impact: int = 2,
+    ai_analysis: bool = True,
+) -> bool:
+    """يفعّل تتبع الأخبار للمستخدم.
+    
+    Args:
+        assets: ["Gold", "EUR/USD", ...] أو None للكل
+        min_impact: 1=low, 2=medium, 3=high only
+        ai_analysis: include quick AI analysis with each alert
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    assets_str = ",".join(assets) if assets else "ALL"
+    db_exec(
+        """INSERT OR REPLACE INTO news_tracking 
+           (chat_id, enabled, assets, min_impact, ai_analysis, started_at)
+           VALUES (?, 1, ?, ?, ?, ?)""",
+        (chat_id, assets_str, min_impact, 1 if ai_analysis else 0, now)
+    )
+    return True
+
+
+def news_tracking_disable(chat_id: str) -> bool:
+    """يلغي تتبع الأخبار."""
+    db_exec(
+        "UPDATE news_tracking SET enabled=0 WHERE chat_id=?",
+        (chat_id,)
+    )
+    return True
+
+
+def news_tracking_get_subscribers() -> List[Dict]:
+    """يجلب كل المستخدمين اللي مفعّلين تتبع الأخبار."""
+    rows = db_exec(
+        "SELECT * FROM news_tracking WHERE enabled=1",
+        fetch="all"
+    )
+    return [dict(r) for r in (rows or [])]
+
+
+def news_tracking_get_status(chat_id: str) -> Optional[Dict]:
+    """يجلب حالة تتبع الأخبار للمستخدم."""
+    row = db_exec(
+        "SELECT * FROM news_tracking WHERE chat_id=?",
+        (chat_id,), fetch="one"
+    )
+    return dict(row) if row else None
+
+
+def news_alert_was_sent(chat_id: str, news_id: str) -> bool:
+    """تحقق هل الخبر اتبعت قبل كده."""
+    row = db_exec(
+        "SELECT 1 FROM news_alerts_sent WHERE chat_id=? AND news_id=? LIMIT 1",
+        (chat_id, news_id), fetch="one"
+    )
+    return bool(row)
+
+
+def news_alert_mark_sent(chat_id: str, news_id: str):
+    """تسجيل إرسال تنبيه خبر."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        db_exec(
+            "INSERT OR IGNORE INTO news_alerts_sent (chat_id, news_id, sent_at) VALUES (?, ?, ?)",
+            (chat_id, news_id, now)
+        )
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2836,6 +3128,579 @@ async def monitor_high_impact_news(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 17.5) TRADE MONITOR — يفحص الصفقات النشطة كل 5 دقائق
+# ═══════════════════════════════════════════════════════════════════════
+# Mapping: asset → (yfinance_ticker, polygon_asset_key)
+ASSET_TICKERS = {
+    "Gold":    ("GC=F",      "XAU/USD"),
+    "Silver":  ("SI=F",      "XAG/USD"),
+    "EUR/USD": ("EURUSD=X",  "EUR/USD"),
+    "GBP/USD": ("GBPUSD=X",  "GBP/USD"),
+    "USD/JPY": ("JPY=X",     "USD/JPY"),
+    "USD/CHF": ("CHF=X",     "USD/CHF"),
+    "AUD/USD": ("AUDUSD=X",  "AUD/USD"),
+    "Oil":     ("CL=F",      "WTI"),
+    "USD/DXY": ("DX-Y.NYB",  None),
+}
+
+
+def trade_get_current_price(asset: str) -> Optional[float]:
+    """يجلب السعر الحالي للأصل (Polygon أولاً، yfinance fallback)."""
+    ticker_info = ASSET_TICKERS.get(asset)
+    if not ticker_info:
+        return None
+    
+    yf_ticker, poly_key = ticker_info
+    
+    # Polygon أولاً
+    if poly_key:
+        try:
+            data = polygon_get_asset_price(poly_key)
+            if data and data.get("price"):
+                return float(data["price"])
+        except Exception:
+            pass
+    
+    # yfinance fallback
+    try:
+        t = yf.Ticker(yf_ticker)
+        hist = t.history(period="1d", interval="1m")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    
+    return None
+
+
+async def trade_send_alert(
+    bot, chat_id: str, trade: Dict, alert_type: str,
+    title: str, message: str
+):
+    """يرسل تنبيه للمستخدم ويسجّله."""
+    try:
+        full_msg = (
+            f"🔔 *تنبيه صفقة #{trade['id']}*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"{title}\n\n"
+            f"{message}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 *{trade['asset']}* | {trade['action']}\n"
+            f"💰 Entry: `{trade['entry_price']:.4f}`"
+        )
+        await bot.send_message(chat_id=int(chat_id), text=full_msg, parse_mode="Markdown")
+        track_mark_alert_sent(trade["id"], alert_type)
+        track_update_trade(
+            trade["id"],
+            last_alert_at=datetime.now(timezone.utc).isoformat()
+        )
+    except Exception as e:
+        log.warning(f"trade alert {chat_id}: {e}")
+
+
+async def trade_check_single(trade: Dict, send_alert: bool = True, bot=None) -> Dict:
+    """يفحص صفقة واحدة ويرجّع الحالة (يرسل تنبيهات لو send_alert=True).
+    
+    Returns: {
+        "current_price": float,
+        "alerts": [list of alert strings],
+        "should_close": bool,
+    }
+    """
+    asset = trade["asset"]
+    entry = trade["entry_price"]
+    is_buy = trade["action"] in ("BUY", "ADD")
+    sl = trade.get("sl")
+    tp1 = trade.get("tp1")
+    tp2 = trade.get("tp2")
+    tp3 = trade.get("tp3")
+    
+    current_price = trade_get_current_price(asset)
+    if not current_price:
+        return {"current_price": None, "alerts": [], "should_close": False}
+    
+    # تحديث آخر فحص
+    track_update_trade(
+        trade["id"],
+        last_check_at=datetime.now(timezone.utc).isoformat()
+    )
+    
+    alerts = []
+    should_close = False
+    
+    # ─── 1. فحص SL ───
+    if sl is not None:
+        sl_hit = (is_buy and current_price <= sl) or (not is_buy and current_price >= sl)
+        if sl_hit and not track_alert_was_sent(trade["id"], "SL_HIT"):
+            pnl_d, pnl_p = track_calculate_pnl(trade, current_price)
+            alerts.append({
+                "type": "SL_HIT",
+                "title": "🛑 *SL HIT — تم ضرب وقف الخسارة*",
+                "msg": (
+                    f"السعر الحالي: `{current_price:.4f}`\n"
+                    f"SL: `{sl:.4f}`\n"
+                    f"📉 الخسارة: `{pnl_p:+.2f}%` (`${pnl_d:+.2f}`)\n\n"
+                    f"⚠️ *الصفقة مغلقة تلقائياً*\n"
+                    f"تذكر: SL = حماية، ضربه جزء من الإستراتيجية ✓"
+                ),
+            })
+            should_close = True
+            if send_alert and bot:
+                track_close_trade(trade["id"], current_price, "SL", pnl_d, pnl_p)
+    
+    # ─── 2. فحص TP3 (الأهم - إغلاق كامل) ───
+    if not should_close and tp3 and not trade.get("tp3_hit"):
+        tp3_hit = (is_buy and current_price >= tp3) or (not is_buy and current_price <= tp3)
+        if tp3_hit and not track_alert_was_sent(trade["id"], "TP3_HIT"):
+            pnl_d, pnl_p = track_calculate_pnl(trade, current_price)
+            alerts.append({
+                "type": "TP3_HIT",
+                "title": "🎯🎯🎯 *TP3 HIT — الهدف الأقصى!*",
+                "msg": (
+                    f"السعر الحالي: `{current_price:.4f}`\n"
+                    f"TP3: `{tp3:.4f}`\n"
+                    f"💰 الربح: `{pnl_p:+.2f}%` (`${pnl_d:+.2f}`)\n\n"
+                    f"✅ *مبروك! الصفقة وصلت أعلى هدف*\n"
+                    f"اقفل المتبقي (20%) — الصفقة مكتملة 🏆"
+                ),
+            })
+            track_update_trade(trade["id"], tp3_hit=1)
+            should_close = True
+            if send_alert and bot:
+                track_close_trade(trade["id"], current_price, "TP3", pnl_d, pnl_p)
+    
+    # ─── 3. فحص TP2 ───
+    if not should_close and tp2 and not trade.get("tp2_hit"):
+        tp2_hit = (is_buy and current_price >= tp2) or (not is_buy and current_price <= tp2)
+        if tp2_hit and not track_alert_was_sent(trade["id"], "TP2_HIT"):
+            pnl_d, pnl_p = track_calculate_pnl(trade, current_price)
+            alerts.append({
+                "type": "TP2_HIT",
+                "title": "🎯🎯 *TP2 HIT — الهدف الثاني!*",
+                "msg": (
+                    f"السعر الحالي: `{current_price:.4f}`\n"
+                    f"TP2: `{tp2:.4f}`\n"
+                    f"💰 الربح: `{pnl_p:+.2f}%` (`${pnl_d:+.2f}`)\n\n"
+                    f"✅ *إجراءات مقترحة:*\n"
+                    f"• اقفل 30% إضافية (مجموع 80%)\n"
+                    f"• حرّك SL إلى TP1 (`{tp1:.4f}`) — لقفل الربح\n"
+                    f"• اترك 20% للـTP3"
+                ),
+            })
+            track_update_trade(trade["id"], tp2_hit=1, partial_closed_pct=80)
+    
+    # ─── 4. فحص TP1 ───
+    if not should_close and tp1 and not trade.get("tp1_hit"):
+        tp1_hit = (is_buy and current_price >= tp1) or (not is_buy and current_price <= tp1)
+        if tp1_hit and not track_alert_was_sent(trade["id"], "TP1_HIT"):
+            pnl_d, pnl_p = track_calculate_pnl(trade, current_price)
+            alerts.append({
+                "type": "TP1_HIT",
+                "title": "🎯 *TP1 HIT — الهدف الأول!*",
+                "msg": (
+                    f"السعر الحالي: `{current_price:.4f}`\n"
+                    f"TP1: `{tp1:.4f}`\n"
+                    f"💰 الربح: `{pnl_p:+.2f}%` (`${pnl_d:+.2f}`)\n\n"
+                    f"✅ *إجراءات مقترحة:*\n"
+                    f"• اقفل 50% من الصفقة (Partial Close)\n"
+                    f"• حرّك SL إلى Breakeven (`{entry:.4f}`)\n"
+                    f"• الباقي (50%) للـTP2 و TP3"
+                ),
+            })
+            track_update_trade(trade["id"], tp1_hit=1, partial_closed_pct=50,
+                              sl_moved_to_be=1)
+    
+    # ─── 5. تنبيه قرب TP1 (1% بعيد) ───
+    if not should_close and tp1 and not trade.get("tp1_hit"):
+        distance_to_tp1 = abs(current_price - tp1) / current_price * 100
+        if distance_to_tp1 < 1.0:
+            in_direction = (is_buy and current_price < tp1) or (not is_buy and current_price > tp1)
+            if in_direction and not track_alert_was_sent(trade["id"], "NEAR_TP1"):
+                alerts.append({
+                    "type": "NEAR_TP1",
+                    "title": "⚠️ *قريب من TP1 — استعد!*",
+                    "msg": (
+                        f"السعر الحالي: `{current_price:.4f}`\n"
+                        f"TP1: `{tp1:.4f}`\n"
+                        f"📏 المسافة: `{distance_to_tp1:.2f}%`\n\n"
+                        f"💡 جهّز أمر إغلاق جزئي 50%"
+                    ),
+                })
+    
+    # ─── 6. تنبيه قرب SL (1% بعيد) ───
+    if not should_close and sl is not None:
+        distance_to_sl = abs(current_price - sl) / current_price * 100
+        if distance_to_sl < 1.0:
+            in_danger = (is_buy and current_price > sl) or (not is_buy and current_price < sl)
+            if in_danger and not track_alert_was_sent(trade["id"], "NEAR_SL"):
+                pnl_d, pnl_p = track_calculate_pnl(trade, current_price)
+                alerts.append({
+                    "type": "NEAR_SL",
+                    "title": "⚠️ *قريب من SL — حذر!*",
+                    "msg": (
+                        f"السعر الحالي: `{current_price:.4f}`\n"
+                        f"SL: `{sl:.4f}`\n"
+                        f"📏 المسافة: `{distance_to_sl:.2f}%`\n"
+                        f"📉 PnL الحالي: `{pnl_p:+.2f}%`\n\n"
+                        f"💡 *خياراتك:*\n"
+                        f"• انتظر تأكيد الكسر\n"
+                        f"• اقفل يدوياً لتقليل الخسارة\n"
+                        f"• راقب البيانات الفنية"
+                    ),
+                })
+    
+    # ─── إرسال التنبيهات ───
+    if send_alert and bot:
+        for alert in alerts:
+            await trade_send_alert(
+                bot, trade["chat_id"], trade,
+                alert["type"], alert["title"], alert["msg"]
+            )
+            await asyncio.sleep(0.3)
+    
+    return {
+        "current_price": current_price,
+        "alerts": alerts,
+        "should_close": should_close,
+    }
+
+
+async def trade_monitor_callback(context: ContextTypes.DEFAULT_TYPE):
+    """Monitor الرئيسي للصفقات — يشتغل كل 5 دقائق."""
+    try:
+        active_trades = track_get_active_trades()
+        if not active_trades:
+            return
+        
+        log.info(f"📊 Trade Monitor: فحص {len(active_trades)} صفقة نشطة")
+        
+        for trade in active_trades:
+            try:
+                await trade_check_single(trade, send_alert=True, bot=context.bot)
+                await asyncio.sleep(0.5)  # تجنب rate limits
+            except Exception as e:
+                log.warning(f"trade {trade['id']} check: {e}")
+        
+        # ─── فحص Smart Money / Liquidity changes (مرة كل ساعة) ───
+        # نتحقق هل عدّى ساعة من آخر فحص متقدم
+        last_advanced = cache_get("last_advanced_trade_check")
+        if not last_advanced:
+            await trade_advanced_check(context.bot, active_trades)
+            cache_set("last_advanced_trade_check", "1", ttl_seconds=3600)
+            
+    except Exception as e:
+        log.warning(f"trade monitor: {e}")
+
+
+async def trade_advanced_check(bot, active_trades: List[Dict]):
+    """فحص متقدم: تغير Smart Money + ADD opportunities (كل ساعة)."""
+    for trade in active_trades:
+        try:
+            asset = trade["asset"]
+            ticker_info = ASSET_TICKERS.get(asset)
+            if not ticker_info:
+                continue
+            yf_ticker, poly_key = ticker_info
+            
+            # نجلب DataFrame
+            if poly_key:
+                df, _ = get_asset_dataframe_scaled(poly_key, yf_ticker, "3mo", "1d")
+            else:
+                t = yf.Ticker(yf_ticker)
+                df = t.history(period="3mo", interval="1d")
+            
+            if df is None or df.empty:
+                continue
+            
+            # نستخدم Smart Money detection من smart_risk
+            sm_zones = smart_risk.find_smart_money_zones(df, asset)
+            liq_pools = smart_risk.find_liquidity_pools(df, asset)
+            
+            entry = trade["entry_price"]
+            is_buy = trade["action"] in ("BUY", "ADD")
+            
+            # ─── ADD Opportunity: السعر رجع لـbullish OB قوي ───
+            current_price = float(df["Close"].iloc[-1])
+            
+            if is_buy:
+                # نشوف هل في bullish OB قريب من السعر الحالي
+                for ob in sm_zones.get("bullish_obs", [])[:3]:
+                    ob_low = ob.get("low", 0)
+                    ob_high = ob.get("high", 0)
+                    in_ob = ob_low <= current_price <= ob_high
+                    if in_ob and ob["bars_ago"] < 10:  # OB حديث
+                        if not track_alert_was_sent(trade["id"], f"ADD_OB_{ob_low:.2f}"):
+                            await trade_send_alert(
+                                bot, trade["chat_id"], trade,
+                                f"ADD_OB_{ob_low:.2f}",
+                                "🐋 *فرصة ADD — Bullish Order Block*",
+                                (
+                                    f"السعر دخل في Bullish Order Block!\n\n"
+                                    f"💰 السعر: `{current_price:.4f}`\n"
+                                    f"🐋 OB Range: `{ob_low:.4f}` - `{ob_high:.4f}`\n"
+                                    f"📅 منذ: {ob['bars_ago']} bars\n"
+                                    f"💪 القوة: {ob['strength']}\n\n"
+                                    f"💡 *قد تكون فرصة ADD*\n"
+                                    f"• راقب الـreaction\n"
+                                    f"• حجم إضافي 30-50% من الأصلي\n"
+                                    f"• SL: تحت الـOB low"
+                                )
+                            )
+                            break
+            else:
+                # SELL → نشوف bearish OBs
+                for ob in sm_zones.get("bearish_obs", [])[:3]:
+                    ob_low = ob.get("low", 0)
+                    ob_high = ob.get("high", 0)
+                    in_ob = ob_low <= current_price <= ob_high
+                    if in_ob and ob["bars_ago"] < 10:
+                        if not track_alert_was_sent(trade["id"], f"ADD_OB_{ob_high:.2f}"):
+                            await trade_send_alert(
+                                bot, trade["chat_id"], trade,
+                                f"ADD_OB_{ob_high:.2f}",
+                                "🐋 *فرصة ADD — Bearish Order Block*",
+                                (
+                                    f"السعر دخل في Bearish Order Block!\n\n"
+                                    f"💰 السعر: `{current_price:.4f}`\n"
+                                    f"🐋 OB Range: `{ob_low:.4f}` - `{ob_high:.4f}`\n"
+                                    f"📅 منذ: {ob['bars_ago']} bars\n\n"
+                                    f"💡 فرصة ADD للـSHORT"
+                                )
+                            )
+                            break
+            
+            # ─── تنبيه: Liquidity Sweep حصل في الاتجاه ───
+            # نشوف هل في pool في اتجاه TP اتمسح حديثاً
+            if is_buy:
+                for pool in liq_pools.get("buy_side", [])[:3]:
+                    if pool.get("is_swept") and pool["price"] < trade.get("tp1", float('inf')):
+                        if not track_alert_was_sent(trade["id"], f"SWEEP_{pool['price']:.2f}"):
+                            await trade_send_alert(
+                                bot, trade["chat_id"], trade,
+                                f"SWEEP_{pool['price']:.2f}",
+                                "💧 *Liquidity Sweep — في صالحك*",
+                                (
+                                    f"الحيتان مسحت liquidity pool في اتجاه صفقتك!\n\n"
+                                    f"📍 المستوى: `{pool['price']:.4f}`\n"
+                                    f"📊 النوع: {pool['type']}\n\n"
+                                    f"💡 الاحتمالية ارتفعت لوصول TP"
+                                )
+                            )
+                            break
+            
+        except Exception as e:
+            log.warning(f"advanced check {trade.get('id')}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 17.6) NEWS TRACKING MONITOR — أخبار عاجلة + تحليل AI فوري
+# ═══════════════════════════════════════════════════════════════════════
+def quick_ai_news_analysis(news_item: Dict, related_assets: List[str]) -> str:
+    """تحليل AI سريع لخبر عاجل (10-15 ثانية).
+    
+    يستخدم Claude فقط (الأسرع) لإعطاء رأي فوري.
+    """
+    title = news_item.get("title", "")
+    source = news_item.get("source", "")
+    summary = news_item.get("summary", "")[:500]
+    
+    assets_text = ", ".join(related_assets) if related_assets else "Gold/Forex"
+    
+    prompt = f"""خبر عاجل من {source}:
+
+"{title}"
+
+{summary if summary else ''}
+
+الأصول المتأثرة: {assets_text}
+
+مهمتك: تحليل سريع (تحت 200 كلمة) كمحلل صناديق تحوّط:
+
+1️⃣ **التأثير المتوقع** (Bullish/Bearish/Neutral) على كل أصل
+2️⃣ **القوة** (قوي/متوسط/ضعيف)
+3️⃣ **التوقيت** (فوري / تدريجي / مؤجل)
+4️⃣ **توصية فورية:**
+   • BUY/SELL/HOLD/تجنّب الدخول
+   • مستويات حرجة للمراقبة
+   • أسباب موجزة (3 أسباب فقط)
+
+⚡ كن مباشر ومحدد - ليس تنظير عام."""
+    
+    try:
+        return ask_claude(prompt, max_tokens=600)
+    except Exception as e:
+        log.warning(f"AI news analysis: {e}")
+        return ""
+
+
+def get_affected_assets(news_item: Dict) -> List[str]:
+    """يحدد الأصول المتأثرة بالخبر بناء على keywords."""
+    text = (news_item.get("title", "") + " " + news_item.get("summary", "")).lower()
+    
+    affected = []
+    
+    # Gold keywords
+    if any(k in text for k in ["gold", "xauusd", "ذهب", "precious metals", "bullion"]):
+        affected.append("Gold")
+    # Silver
+    if any(k in text for k in ["silver", "xagusd", "فضة"]):
+        affected.append("Silver")
+    # USD
+    if any(k in text for k in ["dollar", "usd", "fed", "fomc", "powell", "treasury", "yields"]):
+        affected.extend(["EUR/USD", "GBP/USD", "USD/JPY"])
+    # Euro
+    if any(k in text for k in ["euro", "eur", "ecb", "lagarde", "europe"]):
+        affected.append("EUR/USD")
+    # GBP
+    if any(k in text for k in ["pound", "gbp", "sterling", "boe", "bailey", "uk", "britain"]):
+        affected.append("GBP/USD")
+    # JPY
+    if any(k in text for k in ["yen", "jpy", "boj", "ueda", "japan"]):
+        affected.append("USD/JPY")
+    # Oil
+    if any(k in text for k in ["oil", "crude", "wti", "brent", "opec", "بترول", "نفط"]):
+        affected.append("Oil")
+    # General macro affecting all
+    if any(k in text for k in ["cpi", "ppi", "nfp", "gdp", "unemployment", "inflation"]):
+        if not affected:
+            affected = ["Gold", "EUR/USD", "USD/JPY"]
+    
+    return list(set(affected))[:4]  # Deduplicate, limit to 4
+
+
+async def news_tracking_monitor(context: ContextTypes.DEFAULT_TYPE):
+    """Monitor للأخبار العاجلة — يشتغل كل 5 دقائق."""
+    try:
+        subscribers = news_tracking_get_subscribers()
+        if not subscribers:
+            return
+        
+        # جلب أخبار آخر 15 دقيقة فقط (الأكثر طزاجة)
+        news = fetch_news(max_per_source=5, hours_back=1)
+        if not news:
+            return
+        
+        # فلترة عالية التأثير فقط
+        urgent = []
+        for n in news:
+            is_high, _ = is_high_impact(n)
+            if not is_high:
+                continue
+            # عمر الخبر
+            try:
+                pub_str = n.get("published_at") or n.get("pubDate", "")
+                if pub_str:
+                    pub_dt = datetime.fromisoformat(str(pub_str).replace("Z", "+00:00"))
+                    if pub_dt.tzinfo is None:
+                        pub_dt = pub_dt.replace(tzinfo=pytz.UTC)
+                    age_minutes = (datetime.now(pytz.UTC) - pub_dt).total_seconds() / 60
+                    if age_minutes > 60:  # أقدم من ساعة
+                        continue
+            except Exception:
+                pass
+            urgent.append(n)
+        
+        if not urgent:
+            return
+        
+        log.info(f"📰 News Monitor: {len(urgent)} خبر عاجل، {len(subscribers)} مشترك")
+        
+        # نتعامل مع كل مشترك
+        for sub in subscribers:
+            chat_id = sub["chat_id"]
+            user_assets = sub.get("assets", "ALL")
+            wants_ai = bool(sub.get("ai_analysis", 1))
+            
+            for news_item in urgent:
+                # ID فريد للخبر (لتجنب التكرار)
+                news_id = news_item.get("link") or news_item.get("title", "")[:100]
+                
+                if news_alert_was_sent(chat_id, news_id):
+                    continue
+                
+                # فلترة بالأصول
+                affected = get_affected_assets(news_item)
+                if not affected:
+                    continue
+                
+                if user_assets != "ALL":
+                    user_asset_list = [a.strip() for a in user_assets.split(",")]
+                    if not any(a in user_asset_list for a in affected):
+                        continue
+                
+                # ─── تحضير الرسالة ───
+                title = news_item.get("title", "")[:200]
+                source = news_item.get("source", "?")
+                link = news_item.get("link", "")
+                
+                msg = f"🚨 *خبر عاجل — {source}*\n"
+                msg += "━━━━━━━━━━━━━━━━━━━\n\n"
+                msg += f"📰 *{title}*\n\n"
+                msg += f"🎯 الأصول المتأثرة: {', '.join(affected)}\n\n"
+                
+                # ─── تحليل AI سريع ───
+                if wants_ai:
+                    msg += "━━━━━━━━━━━━━━━━━━━\n"
+                    msg += "🧠 *تحليل AI سريع:*\n\n"
+                    try:
+                        analysis = quick_ai_news_analysis(news_item, affected)
+                        if analysis:
+                            # نقصّ التحليل لو طويل جداً
+                            if len(analysis) > 1500:
+                                analysis = analysis[:1500] + "..."
+                            msg += analysis
+                        else:
+                            msg += "_التحليل غير متاح حالياً_"
+                    except Exception as e:
+                        log.warning(f"AI analysis: {e}")
+                        msg += "_التحليل تأخر — راجع الخبر يدوياً_"
+                
+                msg += "\n\n━━━━━━━━━━━━━━━━━━━\n"
+                if link:
+                    msg += f"🔗 [اقرأ الخبر الكامل]({link})\n\n"
+                msg += "_⚠️ تحليل تعليمي — ليس نصيحة استثمارية_"
+                
+                # ─── إرسال ───
+                try:
+                    # نقسّم الرسالة لو طويلة
+                    if len(msg) > 4000:
+                        await context.bot.send_message(
+                            chat_id=int(chat_id),
+                            text=msg[:4000] + "...",
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=int(chat_id),
+                            text=msg,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    news_alert_mark_sent(chat_id, news_id)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    log.warning(f"news alert send {chat_id}: {e}")
+                    # في حالة فشل markdown، نرسل بلا تنسيق
+                    try:
+                        plain = msg.replace("*", "").replace("`", "").replace("_", "")
+                        await context.bot.send_message(
+                            chat_id=int(chat_id),
+                            text=plain[:4000],
+                            disable_web_page_preview=True,
+                        )
+                        news_alert_mark_sent(chat_id, news_id)
+                    except Exception:
+                        pass
+            
+            # تأخير صغير بين المشتركين
+            await asyncio.sleep(0.3)
+            
+    except Exception as e:
+        log.warning(f"news tracking monitor: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 18) DAILY BRIEFING SCHEDULER
 # ═══════════════════════════════════════════════════════════════════════
 async def daily_briefing_callback(context: ContextTypes.DEFAULT_TYPE):
@@ -2895,13 +3760,32 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "  ▸ 3 مستويات SL خلف الـpools\n"
         "  ▸ 3 أهداف TP عند الـpools\n"
         "  ▸ Position Sizing + Partial Close\n\n"
-        "⚡ *Scalping Analysis* ✨ جديد:\n"
+        "⚡ *Scalping Analysis:*\n"
         "`سكالب ذهب` — تحليل 7 مؤشرات على 1m/5m\n"
         "`سكالب eurusd` / `سكالب gbpusd`\n"
         "`سكالب فضة` / `سكالب بترول`\n"
         "  ▸ RSI(7) + EMA Cross + Bollinger\n"
         "  ▸ Volume + Stochastic + ATR + Candle\n"
         "  ▸ قرار LONG/SHORT/WAIT + SL/TP ضيق\n\n"
+        "📊 *Live Trade Tracking* ✨ جديد:\n"
+        "`تتبع` — عرض آخر توصية\n"
+        "`تتبع ذهب 0.05` — تفعيل تتبع نشط\n"
+        "`صفقاتي` — كل صفقاتك المتابَعة\n"
+        "`حالة_صفقة [ID]` — تحديث فوري\n"
+        "`الغاء_تتبع [ID]` — إيقاف التتبع\n"
+        "`اقفل_صفقة [ID] [سعر]` — إغلاق يدوي\n"
+        "  ▸ تنبيه عند TP1/TP2/TP3/SL\n"
+        "  ▸ نصيحة تحريك SL لـBreakeven\n"
+        "  ▸ فرص ADD عند Order Blocks\n"
+        "  ▸ تنبيه Liquidity Sweeps\n\n"
+        "📰 *Live News Tracking* ✨ جديد:\n"
+        "`تتبع_اخبار` — كل الأصول\n"
+        "`تتبع_اخبار ذهب فوركس` — مخصّص\n"
+        "`حالة_اخبار` — عرض الإعدادات\n"
+        "`وقف_اخبار` — إيقاف\n"
+        "  ▸ خبر عاجل + تحليل AI فوري\n"
+        "  ▸ تأثير على الأصول + توصية\n"
+        "  ▸ مستويات حرجة للمراقبة\n\n"
         "📊 *التحليل العميق:*\n"
         "`تحليل` — تحليل سوق شامل\n"
         "`فني` — التحليل الفني (RSI/MACD/EMA/BB/ICT)\n"
@@ -2990,6 +3874,450 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         for m in msgs:
             await send_long(u, m)
             await asyncio.sleep(0.4)
+        return
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # 📊 LIVE TRADE TRACKING — تتبع الصفقات النشطة
+    # ═══════════════════════════════════════════════════════════════════
+    
+    # ─── أمر "تتبع آخر توصية" ───
+    # الصيغة: تتبع [الأصل] [position_size اختياري]
+    # مثال: تتبع ذهب 0.05    → يتتبع آخر توصية ذهب بحجم 0.05 لوت
+    # مثال: تتبع              → يعرض آخر توصية ويسأل
+    if text.startswith(("تتبع", "track", "متابعة")) and not text.startswith(("تتبع_اخبار", "تتبع اخبار", "تتبع أخبار", "track_news", "تتبع_أخبار")):
+        parts = text.split()
+        
+        # ─── حالة 1: "تتبع" بدون أصل = عرض آخر توصية ───
+        if len(parts) == 1:
+            last_rec = db_exec(
+                "SELECT * FROM recommendations WHERE chat_id=? AND status='OPEN' "
+                "AND action IN ('BUY', 'SELL', 'ADD') ORDER BY created_at DESC LIMIT 1",
+                (chat_id,), fetch="one"
+            )
+            if not last_rec:
+                await u.message.reply_text(
+                    "⚠️ *لا توجد توصية نشطة لتتبعها*\n\n"
+                    "أرسل `ذهب` أو `توصية دولار` للحصول على توصية جديدة، "
+                    "ثم استخدم `تتبع` لمتابعتها.",
+                    parse_mode="Markdown"
+                )
+                return
+            
+            asset = last_rec["asset"]
+            action = last_rec["action"]
+            entry = last_rec["entry_price"]
+            
+            await u.message.reply_text(
+                f"🎯 *آخر توصية:*\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 الأصل: *{asset}*\n"
+                f"⚡ Action: `{action}`\n"
+                f"💰 Entry: `{entry:.4f}`\n"
+                f"🛑 SL: `{last_rec.get('stop_loss', '—')}`\n"
+                f"🎯 TP1/2/3: `{last_rec.get('take_profit_1','—')}` / "
+                f"`{last_rec.get('take_profit_2','—')}` / `{last_rec.get('take_profit_3','—')}`\n\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"*لتفعيل التتبع:*\n"
+                f"`تتبع {asset.lower().replace(' ', '').replace('/', '')} 0.05`\n"
+                f"_(0.05 = حجم الصفقة بالـlots)_\n\n"
+                f"_إذا لم تفعّل التتبع، البوت لن يعطيك إرشادات على هذه الصفقة._",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # ─── حالة 2: "تتبع [أصل] [حجم]" = تفعيل تتبع ───
+        if len(parts) >= 2:
+            asset_input = parts[1].lower()
+            position_size = float(parts[2]) if len(parts) >= 3 else 0.01
+            
+            # خريطة الأصول
+            asset_map = {
+                "ذهب": "Gold", "gold": "Gold", "xauusd": "Gold",
+                "فضة": "Silver", "silver": "Silver",
+                "دولار": "USD/DXY", "dxy": "USD/DXY",
+                "eurusd": "EUR/USD", "eur": "EUR/USD",
+                "gbpusd": "GBP/USD", "gbp": "GBP/USD",
+                "usdjpy": "USD/JPY", "jpy": "USD/JPY",
+                "usdchf": "USD/CHF", "chf": "USD/CHF",
+                "audusd": "AUD/USD", "aud": "AUD/USD",
+                "بترول": "Oil", "oil": "Oil", "wti": "Oil",
+            }
+            asset = asset_map.get(asset_input)
+            if not asset:
+                await u.message.reply_text(
+                    "⚠️ الأصل غير مدعوم.\n\n"
+                    "*الصيغ المتاحة:*\n"
+                    "• `تتبع ذهب 0.05`\n"
+                    "• `تتبع eurusd 0.10`\n"
+                    "• `تتبع بترول 0.05`",
+                    parse_mode="Markdown"
+                )
+                return
+            
+            # ابحث عن آخر توصية على هذا الأصل
+            last_rec = db_exec(
+                "SELECT * FROM recommendations WHERE chat_id=? AND asset=? "
+                "AND status='OPEN' AND action IN ('BUY', 'SELL', 'ADD') "
+                "ORDER BY created_at DESC LIMIT 1",
+                (chat_id, asset), fetch="one"
+            )
+            
+            if not last_rec:
+                await u.message.reply_text(
+                    f"⚠️ *لا توجد توصية نشطة على {asset}*\n\n"
+                    f"اطلب توصية جديدة أولاً:\n"
+                    f"`{asset_input}` أو `توصية {asset_input}`",
+                    parse_mode="Markdown"
+                )
+                return
+            
+            # تحقق من وجود تتبع نشط لنفس الأصل
+            existing = db_exec(
+                "SELECT id FROM tracked_trades WHERE chat_id=? AND asset=? AND status='ACTIVE'",
+                (chat_id, asset), fetch="one"
+            )
+            if existing:
+                await u.message.reply_text(
+                    f"⚠️ *عندك صفقة نشطة بالفعل على {asset}!*\n"
+                    f"Trade ID: `{existing['id']}`\n\n"
+                    f"اكتب `صفقاتي` لرؤيتها، أو `الغاء_تتبع {existing['id']}` للإلغاء.",
+                    parse_mode="Markdown"
+                )
+                return
+            
+            # ─── إنشاء التتبع ───
+            trade_id = track_create_trade(
+                chat_id=chat_id,
+                asset=asset,
+                action=last_rec["action"],
+                entry=last_rec["entry_price"],
+                sl=last_rec.get("stop_loss"),
+                tp1=last_rec.get("take_profit_1"),
+                tp2=last_rec.get("take_profit_2"),
+                tp3=last_rec.get("take_profit_3"),
+                position_size=position_size,
+                capital=4000,
+                recommendation_id=last_rec["id"],
+                notes=f"Tracked from rec #{last_rec['id']}",
+            )
+            
+            await u.message.reply_text(
+                f"✅ *تم تفعيل التتبع!*\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🆔 Trade ID: `{trade_id}`\n"
+                f"📊 الأصل: *{asset}*\n"
+                f"⚡ Action: `{last_rec['action']}`\n"
+                f"💰 Entry: `{last_rec['entry_price']:.4f}`\n"
+                f"📏 الحجم: `{position_size}` lot\n"
+                f"🛑 SL: `{last_rec.get('stop_loss', '—')}`\n"
+                f"🎯 TPs: `{last_rec.get('take_profit_1','—')}` / "
+                f"`{last_rec.get('take_profit_2','—')}` / `{last_rec.get('take_profit_3','—')}`\n\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 *البوت سيراقب الصفقة الآن:*\n"
+                f"• يفحص السعر كل 5 دقائق\n"
+                f"• يرسل تنبيه عند TP/SL\n"
+                f"• يخبرك بفرص ADD وتغيرات Smart Money\n"
+                f"• ينصحك بتحريك SL لـbreakeven بعد TP1\n\n"
+                f"*أوامر مفيدة:*\n"
+                f"• `صفقاتي` — كل صفقاتك النشطة\n"
+                f"• `الغاء_تتبع {trade_id}` — إلغاء التتبع\n"
+                f"• `حالة_صفقة {trade_id}` — تحديث فوري",
+                parse_mode="Markdown"
+            )
+            return
+    
+    # ─── أمر "صفقاتي" ───
+    if text in ("صفقاتي", "صفقات", "trades", "my_trades", "متابعاتي", "تتبعاتي"):
+        trades = track_get_active_trades(chat_id)
+        if not trades:
+            await u.message.reply_text(
+                "📭 *لا توجد صفقات نشطة*\n\n"
+                "اطلب توصية ثم استخدم `تتبع [أصل] [حجم]`",
+                parse_mode="Markdown"
+            )
+            return
+        
+        msg = f"📊 *صفقاتك النشطة ({len(trades)})*\n"
+        msg += "═══════════════════════════\n\n"
+        
+        # نجلب الأسعار الحالية للحساب
+        try:
+            prices = fetch_prices()
+        except Exception:
+            prices = {}
+        
+        for t in trades:
+            # نحاول إيجاد السعر الحالي
+            current_price = None
+            asset = t["asset"]
+            
+            # mapping للـasset → key in prices dict
+            price_key_map = {
+                "Gold": "Gold (XAUUSD)",
+                "Silver": "Silver (XAGUSD)",
+                "EUR/USD": "EUR/USD",
+                "GBP/USD": "GBP/USD",
+                "USD/JPY": "USD/JPY",
+                "USD/CHF": "USD/CHF",
+                "AUD/USD": "AUD/USD",
+                "Oil": "Oil (WTI)",
+            }
+            price_key = price_key_map.get(asset)
+            if price_key and price_key in prices:
+                current_price = prices[price_key].get("price")
+            
+            entry = t["entry_price"]
+            action = t["action"]
+            tps_hit = sum([t.get("tp1_hit", 0), t.get("tp2_hit", 0), t.get("tp3_hit", 0)])
+            
+            msg += f"━━━ *Trade #{t['id']}* ━━━\n"
+            msg += f"📊 *{asset}* | {action}\n"
+            msg += f"💰 Entry: `{entry:.4f}`\n"
+            
+            if current_price:
+                pnl_dollars, pnl_pct = track_calculate_pnl(t, current_price)
+                pnl_icon = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < 0 else "⚪"
+                msg += f"📈 الحالي: `{current_price:.4f}` ({pnl_icon} {pnl_pct:+.2f}%)\n"
+                msg += f"💵 PnL: `${pnl_dollars:+.2f}`\n"
+            
+            msg += f"📏 الحجم: `{t.get('position_size', 0)}` lot\n"
+            msg += f"🛑 SL: `{t.get('sl', '—')}`"
+            if t.get("sl_moved_to_be"):
+                msg += " (BE ✓)"
+            msg += "\n"
+            
+            tp1_mark = "✅" if t.get("tp1_hit") else "⏳"
+            tp2_mark = "✅" if t.get("tp2_hit") else "⏳"
+            tp3_mark = "✅" if t.get("tp3_hit") else "⏳"
+            msg += f"🎯 TP1: `{t.get('tp1', '—')}` {tp1_mark}\n"
+            msg += f"🎯 TP2: `{t.get('tp2', '—')}` {tp2_mark}\n"
+            msg += f"🎯 TP3: `{t.get('tp3', '—')}` {tp3_mark}\n"
+            
+            partial = t.get("partial_closed_pct", 0)
+            if partial > 0:
+                msg += f"📋 مغلق جزئياً: {partial}%\n"
+            
+            msg += "\n"
+        
+        msg += "═══════════════════════════\n"
+        msg += "*أوامر:*\n"
+        msg += "• `حالة_صفقة [ID]` — تحديث فوري\n"
+        msg += "• `الغاء_تتبع [ID]` — إيقاف التتبع\n"
+        msg += "• `اقفل_صفقة [ID] [سعر]` — إغلاق يدوي"
+        
+        await send_long(u, msg)
+        return
+    
+    # ─── أمر "حالة_صفقة [ID]" ───
+    if text.startswith(("حالة_صفقة", "حالة صفقة", "trade_status", "صفقة")):
+        parts = text.split()
+        if len(parts) < 2:
+            await u.message.reply_text(
+                "⚠️ الصيغة: `حالة_صفقة [ID]`\nمثال: `حالة_صفقة 1`",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            trade_id = int(parts[1])
+        except ValueError:
+            await u.message.reply_text("⚠️ ID لازم يكون رقم")
+            return
+        
+        trade = track_get_trade(trade_id)
+        if not trade or trade["chat_id"] != chat_id:
+            await u.message.reply_text(f"⚠️ صفقة #{trade_id} غير موجودة")
+            return
+        
+        # نفحص حالتها فوراً
+        from_track = await trade_check_single(trade, send_alert=False)
+        
+        msg = f"🔍 *تحديث Trade #{trade_id}*\n"
+        msg += "━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"📊 *{trade['asset']}* | {trade['action']}\n"
+        msg += f"📅 الحالة: {trade['status']}\n"
+        msg += f"💰 Entry: `{trade['entry_price']:.4f}`\n"
+        
+        if from_track and from_track.get("current_price"):
+            cp = from_track["current_price"]
+            pnl_d, pnl_p = track_calculate_pnl(trade, cp)
+            pnl_icon = "🟢" if pnl_p > 0 else "🔴" if pnl_p < 0 else "⚪"
+            msg += f"📈 السعر الحالي: `{cp:.4f}`\n"
+            msg += f"{pnl_icon} PnL: `{pnl_p:+.2f}%` (`${pnl_d:+.2f}`)\n\n"
+        
+        msg += f"🛑 SL: `{trade.get('sl', '—')}`\n"
+        msg += f"🎯 TP1: `{trade.get('tp1', '—')}` {'✅' if trade.get('tp1_hit') else '⏳'}\n"
+        msg += f"🎯 TP2: `{trade.get('tp2', '—')}` {'✅' if trade.get('tp2_hit') else '⏳'}\n"
+        msg += f"🎯 TP3: `{trade.get('tp3', '—')}` {'✅' if trade.get('tp3_hit') else '⏳'}\n"
+        
+        await u.message.reply_text(msg, parse_mode="Markdown")
+        return
+    
+    # ─── أمر "الغاء_تتبع [ID]" ───
+    if text.startswith(("الغاء_تتبع", "إلغاء_تتبع", "untrack", "وقف_تتبع")):
+        parts = text.split()
+        if len(parts) < 2:
+            await u.message.reply_text(
+                "⚠️ الصيغة: `الغاء_تتبع [ID]`",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            trade_id = int(parts[1])
+        except ValueError:
+            await u.message.reply_text("⚠️ ID لازم يكون رقم")
+            return
+        
+        trade = track_get_trade(trade_id)
+        if not trade or trade["chat_id"] != chat_id:
+            await u.message.reply_text(f"⚠️ صفقة #{trade_id} غير موجودة")
+            return
+        
+        track_update_trade(trade_id, status="CANCELED",
+                          closed_at=datetime.now(timezone.utc).isoformat(),
+                          exit_reason="MANUAL_CANCEL")
+        
+        await u.message.reply_text(
+            f"✅ *تم إلغاء تتبع Trade #{trade_id}*\n"
+            f"({trade['asset']} {trade['action']})",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # ─── أمر "اقفل_صفقة [ID] [سعر]" ───
+    if text.startswith(("اقفل_صفقة", "إغلاق_صفقة", "close_trade", "اقفل")):
+        parts = text.split()
+        if len(parts) < 3:
+            await u.message.reply_text(
+                "⚠️ الصيغة: `اقفل_صفقة [ID] [سعر_الإغلاق]`",
+                parse_mode="Markdown"
+            )
+            return
+        try:
+            trade_id = int(parts[1])
+            exit_price = float(parts[2])
+        except ValueError:
+            await u.message.reply_text("⚠️ ID وسعر يجب أن يكونا أرقام")
+            return
+        
+        trade = track_get_trade(trade_id)
+        if not trade or trade["chat_id"] != chat_id:
+            await u.message.reply_text(f"⚠️ صفقة #{trade_id} غير موجودة")
+            return
+        
+        pnl_d, pnl_p = track_calculate_pnl(trade, exit_price)
+        track_close_trade(trade_id, exit_price, "MANUAL", pnl_d, pnl_p)
+        
+        result_icon = "🟢" if pnl_p > 0 else "🔴"
+        await u.message.reply_text(
+            f"✅ *تم إغلاق Trade #{trade_id}*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 {trade['asset']} | {trade['action']}\n"
+            f"💰 Entry: `{trade['entry_price']:.4f}`\n"
+            f"🚪 Exit: `{exit_price:.4f}`\n"
+            f"{result_icon} PnL: `{pnl_p:+.2f}%` (`${pnl_d:+.2f}`)",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # 📰 LIVE NEWS TRACKING — تتبع الأخبار العاجلة
+    # ═══════════════════════════════════════════════════════════════════
+    if text.startswith(("تتبع_اخبار", "تتبع اخبار", "تتبع أخبار", "تتبع_أخبار",
+                        "track_news", "متابعة_اخبار", "اخبار_مباشر")):
+        parts = text.split()
+        # ─── تحديد الأصول من الأمر ───
+        # تتبع اخبار            = كل الأصول
+        # تتبع اخبار ذهب       = الذهب فقط
+        # تتبع اخبار ذهب فوركس = الذهب + الفوركس
+        
+        assets_filter = None
+        if len(parts) >= 3:
+            asset_args = [p.lower() for p in parts[2:]]
+            assets_filter = []
+            for a in asset_args:
+                if a in ("ذهب", "gold", "xau"):
+                    assets_filter.append("Gold")
+                elif a in ("فضة", "silver"):
+                    assets_filter.append("Silver")
+                elif a in ("فوركس", "forex"):
+                    assets_filter.extend(["EUR/USD", "GBP/USD", "USD/JPY"])
+                elif a in ("بترول", "oil"):
+                    assets_filter.append("Oil")
+                elif a in ("الكل", "all"):
+                    assets_filter = None
+                    break
+        
+        news_tracking_enable(
+            chat_id=chat_id,
+            assets=assets_filter,
+            min_impact=2,
+            ai_analysis=True,
+        )
+        
+        assets_text = ", ".join(assets_filter) if assets_filter else "كل الأصول"
+        
+        await u.message.reply_text(
+            f"✅ *تفعيل تتبع الأخبار العاجلة*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📰 الأصول: {assets_text}\n"
+            f"⚡ التأثير: متوسط أو عالي\n"
+            f"🧠 تحليل AI تلقائي: ✅\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 *البوت سيرسل لك الآن:*\n"
+            f"• كل خبر عاجل (high-impact) فور صدوره\n"
+            f"• تحليل AI سريع لتأثير الخبر\n"
+            f"• توصية فورية (BUY/SELL/HOLD/تجنّب)\n"
+            f"• المستويات المهمة للمراقبة\n\n"
+            f"*أوامر:*\n"
+            f"• `وقف_اخبار` — إلغاء التتبع\n"
+            f"• `حالة_اخبار` — عرض الإعدادات",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if text in ("وقف_اخبار", "وقف_أخبار", "stop_news", "الغاء_اخبار", "إلغاء_اخبار"):
+        status = news_tracking_get_status(chat_id)
+        if not status or not status.get("enabled"):
+            await u.message.reply_text(
+                "⚠️ ما عندك تتبع أخبار مفعّل أصلاً.",
+                parse_mode="Markdown"
+            )
+            return
+        
+        news_tracking_disable(chat_id)
+        await u.message.reply_text(
+            "✅ *تم إيقاف تتبع الأخبار العاجلة*\n\n"
+            "_لإعادة التفعيل: `تتبع_اخبار`_",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if text in ("حالة_اخبار", "حالة_أخبار", "news_status"):
+        status = news_tracking_get_status(chat_id)
+        if not status or not status.get("enabled"):
+            await u.message.reply_text(
+                "📭 *تتبع الأخبار غير مفعّل*\n\n"
+                "للتفعيل: `تتبع_اخبار`",
+                parse_mode="Markdown"
+            )
+            return
+        
+        assets = status.get("assets", "ALL")
+        impact_text = {1: "كل الأخبار", 2: "متوسط+عالي", 3: "عالي فقط"}.get(
+            status.get("min_impact", 2), "متوسط+عالي"
+        )
+        
+        await u.message.reply_text(
+            f"📰 *حالة تتبع الأخبار*\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ مفعّل\n"
+            f"📊 الأصول: {assets}\n"
+            f"⚡ التأثير: {impact_text}\n"
+            f"🧠 AI: {'✅' if status.get('ai_analysis') else '❌'}\n"
+            f"📅 بدأ من: {status.get('started_at', '')[:10]}\n\n"
+            f"_للإيقاف: `وقف_اخبار`_",
+            parse_mode="Markdown"
+        )
         return
     
     # ═══ ⚡ SCALPING — تحليل سريع (1m + 5m) ═══
@@ -3684,7 +5012,15 @@ def main():
         jq.run_repeating(daily_briefing_callback, interval=60, first=10)
         jq.run_repeating(monitor_high_impact_news,
                          interval=NEWS_MONITOR_INTERVAL, first=120)
-        print("  ⏰ Schedulers ON (briefing + monitor)")
+        # ═══ تتبع الصفقات النشطة (كل 5 دقائق) ═══
+        jq.run_repeating(trade_monitor_callback, interval=300, first=180)
+        # ═══ تتبع الأخبار العاجلة + AI (كل 5 دقائق) ═══
+        jq.run_repeating(news_tracking_monitor, interval=300, first=240)
+        print("  ⏰ Schedulers ON:")
+        print("     • Daily Briefing (1m check)")
+        print("     • News High-Impact Monitor")
+        print("     • 📊 Trade Monitor (5m)")
+        print("     • 📰 News Tracking + AI (5m)")
     
     print("=" * 70)
     
