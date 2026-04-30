@@ -59,6 +59,12 @@ TRADING_ECON_KEY       = os.environ.get("TRADING_ECON_KEY", "")  # format: "user
 DATABENTO_API_KEY      = os.environ.get("DATABENTO_API_KEY", "")
 FRED_API_KEY           = os.environ.get("FRED_API_KEY", "")
 
+# 💎 Options Sentiment toggle
+# تشغيل/تعطيل ميزة Options Sentiment.
+# اضبطها على "true" لو عندك اشتراك Options Starter ($29/m) أو أعلى.
+# Default = False لأن خطة Currencies Starter ما تشمل Options.
+ENABLE_OPTIONS = os.environ.get("ENABLE_OPTIONS", "false").lower() in ("true", "1", "yes")
+
 # نماذج AI
 CLAUDE_MODEL = "claude-sonnet-4-5"
 GEMINI_MODEL = "gemini-2.0-flash-exp"
@@ -373,9 +379,14 @@ def fetch_prices() -> Dict[str, Dict]:
 # ═══════════════════════════════════════════════════════════════════════
 # 5) POLYGON.IO — Forex + Options
 # ═══════════════════════════════════════════════════════════════════════
-def polygon_get(endpoint: str, params: Dict = None) -> Optional[Dict]:
-    """طلب عام لـPolygon API."""
+def polygon_get(endpoint: str, params: Dict = None, return_error: bool = False) -> Optional[Dict]:
+    """طلب عام لـPolygon API.
+    
+    إذا return_error=True، يرجع dict فيه error info بدل None في حالة الفشل.
+    """
     if not POLYGON_API_KEY:
+        if return_error:
+            return {"_error": "no_key", "_message": "POLYGON_API_KEY غير موجود في Environment Variables"}
         return None
     if params is None:
         params = {}
@@ -385,9 +396,29 @@ def polygon_get(endpoint: str, params: Dict = None) -> Optional[Dict]:
         r = sess.get(url, params=params, timeout=15)
         if r.status_code == 200:
             return r.json()
-        log.warning(f"Polygon HTTP {r.status_code}: {r.text[:200]}")
+        # تفصيل الخطأ
+        err_text = r.text[:500] if r.text else ""
+        log.warning(f"Polygon HTTP {r.status_code}: {err_text[:200]}")
+        if return_error:
+            error_type = "unknown"
+            error_msg = f"HTTP {r.status_code}"
+            if r.status_code == 401:
+                error_type = "auth"
+                error_msg = "API Key غير صحيح أو منتهي"
+            elif r.status_code == 403:
+                error_type = "plan"
+                error_msg = "خطتك على Polygon لا تشمل هذا الـEndpoint (محتاج خطة Options)"
+            elif r.status_code == 429:
+                error_type = "rate_limit"
+                error_msg = "تجاوزت حد الطلبات (5/min على الخطة المجانية)"
+            elif r.status_code == 404:
+                error_type = "not_found"
+                error_msg = "Endpoint غير موجود"
+            return {"_error": error_type, "_message": error_msg, "_status": r.status_code, "_response": err_text}
     except Exception as e:
         log.warning(f"Polygon: {e}")
+        if return_error:
+            return {"_error": "exception", "_message": str(e)}
     return None
 
 
@@ -409,7 +440,56 @@ def polygon_fx_quote(from_curr: str = "EUR", to_curr: str = "USD") -> Optional[D
     return None
 
 
-def polygon_options_aggregate(underlying: str = "GLD") -> Dict:
+def polygon_forex_realtime(pair: str = "C:EURUSD") -> Optional[Dict]:
+    """
+    أسعار Forex real-time من Polygon Currencies plan.
+    Format: C:EURUSD, C:GBPUSD, C:USDJPY...
+    يستفيد من اشتراك Currencies Starter ($49/شهر).
+    """
+    cache_key = f"poly_fx_rt_{pair}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+    
+    # snapshot endpoint للـcurrency
+    data = polygon_get(f"/v2/snapshot/locale/global/markets/forex/tickers/{pair}")
+    if not data or data.get("status") != "OK":
+        return None
+    
+    ticker_data = data.get("ticker", {})
+    if not ticker_data:
+        return None
+    
+    last_quote = ticker_data.get("lastQuote", {})
+    last_trade = ticker_data.get("lastTrade", {})
+    day = ticker_data.get("day", {})
+    prev_day = ticker_data.get("prevDay", {})
+    
+    bid = last_quote.get("b", 0) or last_trade.get("p", 0)
+    ask = last_quote.get("a", 0) or last_trade.get("p", 0)
+    mid = (bid + ask) / 2 if (bid and ask) else (bid or ask)
+    
+    prev_close = prev_day.get("c", 0)
+    change_pct = ((mid - prev_close) / prev_close * 100) if (prev_close and mid) else 0
+    
+    result = {
+        "pair": pair.replace("C:", ""),
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "spread": (ask - bid) if (ask and bid) else 0,
+        "day_high": day.get("h", 0),
+        "day_low": day.get("l", 0),
+        "day_volume": day.get("v", 0),
+        "prev_close": prev_close,
+        "change_pct": change_pct,
+        "updated": last_quote.get("t", 0),
+    }
+    cache_set(cache_key, result, ttl_seconds=30)
+    return result
+
+
+def polygon_options_aggregate(underlying: str = "GLD", return_error: bool = False) -> Dict:
     """
     تجميع بيانات الـoptions chain لتحليل Put/Call sentiment.
     GLD = Gold ETF (best proxy for gold options activity).
@@ -423,8 +503,18 @@ def polygon_options_aggregate(underlying: str = "GLD") -> Dict:
     data = polygon_get(
         f"/v3/snapshot/options/{underlying}",
         {"limit": 250},
+        return_error=return_error,
     )
+    
+    # حالة الخطأ المفصّل
+    if isinstance(data, dict) and data.get("_error"):
+        if return_error:
+            return data  # يرجّع error info
+        return {}
+    
     if not data or "results" not in data:
+        if return_error:
+            return {"_error": "no_data", "_message": "لم يتم استلام بيانات (السوق مغلق أو لا يوجد options)"}
         return {}
     
     results = data["results"]
@@ -1095,8 +1185,8 @@ def gather_all_data(asset: str = "Gold", chat_id: str = None) -> str:
     macro = fred_get_macro_snapshot() if FRED_API_KEY else {}
     cal = fetch_te_calendar(days_ahead=7)[:8]
     
-    # Options data للذهب
-    opts = polygon_options_aggregate("GLD") if POLYGON_API_KEY else {}
+    # Options data للذهب (فقط لو الميزة مُفعّلة + اشتراك Options Starter)
+    opts = polygon_options_aggregate("GLD") if (ENABLE_OPTIONS and POLYGON_API_KEY) else {}
     
     # Technical analysis
     ta_ticker = "GC=F" if asset == "Gold" else "DX-Y.NYB"
@@ -1555,7 +1645,41 @@ def format_cot(cot: Dict) -> str:
 
 def format_options_sentiment(opts: Dict) -> str:
     if not opts:
-        return "💎 *Options Sentiment*\n\nغير متاح (Polygon API مطلوب)"
+        return ("💎 *Options Sentiment*\n\n"
+                "غير متاح (Polygon API مطلوب)\n\n"
+                "💡 جرّب أمر `فحص_polygon` لمعرفة السبب الدقيق")
+    
+    # عرض الخطأ المفصّل لو موجود
+    if opts.get("_error"):
+        err_type = opts.get("_error")
+        err_msg = opts.get("_message", "غير معروف")
+        msg = "💎 *Options Sentiment*\n━━━━━━━━━━━━━━━━━━━\n\n"
+        msg += "❌ *المشكلة:*\n"
+        msg += f"   {err_msg}\n\n"
+        if err_type == "no_key":
+            msg += "🔧 *الحل:*\n"
+            msg += "   • تأكد من إضافة `POLYGON_API_KEY` في Railway Variables\n"
+            msg += "   • Restart الـBot بعد الإضافة\n"
+        elif err_type == "auth":
+            msg += "🔧 *الحل:*\n"
+            msg += "   • الـAPI Key غلط — راجع من polygon.io/dashboard\n"
+            msg += "   • انسخه مرة تانية بدون مسافات\n"
+        elif err_type == "plan":
+            msg += "🔧 *الموقف:*\n"
+            msg += "   • اشتراكك الحالي = *Currencies Starter* ($49/شهر)\n"
+            msg += "   • يشمل: Forex + Crypto فقط\n"
+            msg += "   • لا يشمل: Options (محتاج اشتراك منفصل)\n\n"
+            msg += "💡 *للحصول على Options Sentiment:*\n"
+            msg += "   • اشترك إضافياً في *Options Starter* ($29/شهر)\n"
+            msg += "   • من polygon.io/dashboard\n\n"
+            msg += "✅ *البوت شغّال 100% بدون Options*\n"
+            msg += "Options Sentiment ميزة إضافية فقط — كل التحليلات الأخرى تعمل بكفاءة"
+        elif err_type == "rate_limit":
+            msg += "🔧 *الحل:*\n"
+            msg += "   • انتظر دقيقة وحاول تاني\n"
+            msg += "   • أو ارفع الخطة لتجاوز حد الـ5 طلبات/دقيقة\n"
+        return msg
+    
     msg = f"💎 *Options Sentiment — {opts['underlying']}*\n"
     msg += "━━━━━━━━━━━━━━━━━━━\n\n"
     msg += f"📊 *Volume:*\n"
@@ -1848,6 +1972,9 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "`خيارات` — Options Sentiment (P/C)\n"
         "`بنوك` — البنوك المركزية + Yield Curve\n"
         "`ماكرو` — FRED data + Fed/CPI/GDP\n\n"
+        "💱 *Forex Live:*\n"
+        "`فوركس_مباشر` — أسعار 6 أزواج Real-time (Polygon)\n"
+        "`فحص_polygon` — تشخيص Polygon API\n\n"
         "📰 *الأخبار:*\n"
         "`أخبار` / `أخبار ذهب` / `أخبار فوركس`\n"
         "`عاجل` — High-Impact فقط\n\n"
@@ -1983,9 +2110,156 @@ async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     
     if text in ("خيارات", "options", "opt"):
+        if not ENABLE_OPTIONS:
+            await u.message.reply_text(
+                "💎 *Options Sentiment معطّلة*\n"
+                "━━━━━━━━━━━━━━━━━━━\n\n"
+                "ℹ️ هذه الميزة معطّلة افتراضياً لأنها تحتاج اشتراك *Options Starter* "
+                "($29/شهر إضافي على Polygon)\n\n"
+                "✅ *البديل الأقوى عندك جاهز:*\n"
+                "أمر `حيتان` يعرض *CFTC COT Reports* — وهي **أقوى من Options Sentiment** "
+                "للذهب لأنها تكشف مراكز Hedge Funds الفعلية في *CME Gold Futures* "
+                "(ليس مجرد proxy على GLD ETF).\n\n"
+                "🔧 *لتفعيل الميزة لاحقاً:*\n"
+                "1. اشترك في Options Starter ($29) من polygon.io\n"
+                "2. أضف في Railway Variables: `ENABLE_OPTIONS = true`\n"
+                "3. أعد تشغيل البوت\n\n"
+                "💡 جرّب الآن: `حيتان`",
+                parse_mode="Markdown"
+            )
+            return
         await u.message.reply_text("⏳ *Options Sentiment...*", parse_mode="Markdown")
-        opts = polygon_options_aggregate("GLD")
+        opts = polygon_options_aggregate("GLD", return_error=True)
         await send_long(u, format_options_sentiment(opts))
+        return
+    
+    if text in ("فوركس_مباشر", "فوركس مباشر", "forex_live", "fx", "فوركس"):
+        await u.message.reply_text("⏳ *جاري جلب أسعار Forex مباشرة من Polygon...*", parse_mode="Markdown")
+        
+        if not POLYGON_API_KEY:
+            await u.message.reply_text(
+                "❌ *Polygon API غير مفعّل*\n\nأضف `POLYGON_API_KEY` في Variables",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # أهم 6 أزواج
+        pairs = [
+            ("C:EURUSD", "EUR/USD"),
+            ("C:GBPUSD", "GBP/USD"),
+            ("C:USDJPY", "USD/JPY"),
+            ("C:USDCHF", "USD/CHF"),
+            ("C:AUDUSD", "AUD/USD"),
+            ("C:USDCAD", "USD/CAD"),
+        ]
+        
+        msg = "💱 *Forex Live — Polygon Real-time*\n"
+        msg += "━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        any_data = False
+        for ticker, name in pairs:
+            data = polygon_forex_realtime(ticker)
+            if not data or not data.get("mid"):
+                msg += f"*{name}:* غير متاح\n"
+                continue
+            any_data = True
+            arrow = "🟢" if data["change_pct"] > 0 else "🔴" if data["change_pct"] < 0 else "⚪"
+            decimals = 2 if "JPY" in name else 5
+            msg += f"{arrow} *{name}:* `{data['mid']:.{decimals}f}`\n"
+            msg += f"   التغير: `{data['change_pct']:+.2f}%`\n"
+            msg += f"   Bid/Ask: `{data['bid']:.{decimals}f}` / `{data['ask']:.{decimals}f}`\n"
+            if data.get("day_high") and data.get("day_low"):
+                msg += f"   Range اليوم: `{data['day_low']:.{decimals}f}` - `{data['day_high']:.{decimals}f}`\n"
+            msg += "\n"
+        
+        if not any_data:
+            msg += "❌ *لم يتم استلام بيانات*\n\n"
+            msg += "💡 جرّب أمر `فحص_polygon` للتشخيص"
+        else:
+            msg += "━━━━━━━━━━━━━━━━━━━\n"
+            msg += "💎 _Powered by Polygon Currencies Starter_\n"
+            msg += "_البيانات Real-time + Cache 30s_"
+        
+        await send_long(u, msg)
+        return
+    
+    if text in ("فحص_polygon", "polygon_test", "polygon", "فحص بوليجون"):
+        await u.message.reply_text("🔍 *جاري فحص Polygon API...*", parse_mode="Markdown")
+        msg = "🔍 *تشخيص Polygon API*\n"
+        msg += "━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        # 1) فحص وجود الـkey
+        if not POLYGON_API_KEY:
+            msg += "❌ *POLYGON_API_KEY غير موجود*\n\n"
+            msg += "🔧 *الحل:*\n"
+            msg += "1. روح Railway → Project → Variables\n"
+            msg += "2. أضف: `POLYGON_API_KEY = your_key_here`\n"
+            msg += "3. أعد تشغيل الـBot\n"
+            await send_long(u, msg)
+            return
+        
+        # نخفي معظم الـkey
+        masked = POLYGON_API_KEY[:6] + "..." + POLYGON_API_KEY[-4:] if len(POLYGON_API_KEY) > 10 else "***"
+        msg += f"✅ API Key موجود: `{masked}`\n"
+        msg += f"   الطول: {len(POLYGON_API_KEY)} حرف\n\n"
+        
+        # 2) اختبار endpoint مجاني (أساسي - متاح في كل الخطط)
+        msg += "*1️⃣ اختبار endpoint مجاني (Tickers):*\n"
+        test1 = polygon_get("/v3/reference/tickers", {"limit": 1}, return_error=True)
+        if isinstance(test1, dict) and test1.get("_error"):
+            msg += f"   ❌ فشل: {test1.get('_message')}\n"
+            msg += f"   Status: {test1.get('_status', 'N/A')}\n\n"
+            msg += "🔧 *المشكلة في الـAPI Key نفسه — راجعه*\n"
+            await send_long(u, msg)
+            return
+        elif test1 and "results" in test1:
+            msg += f"   ✅ نجح — الـAPI Key شغّال\n\n"
+        else:
+            msg += f"   ⚠️ رد غريب من السيرفر\n\n"
+        
+        # 3) اختبار Stocks (يحتاج Stocks plan)
+        msg += "*2️⃣ اختبار Stocks Snapshot:*\n"
+        test2 = polygon_get("/v2/snapshot/locale/us/markets/stocks/tickers/AAPL", return_error=True)
+        if isinstance(test2, dict) and test2.get("_error"):
+            err_type = test2.get('_error')
+            if err_type == "plan":
+                msg += f"   ❌ خطتك ما فيهاش Stocks\n"
+            else:
+                msg += f"   ❌ {test2.get('_message')}\n"
+        elif test2 and test2.get("status") == "OK":
+            msg += f"   ✅ Stocks متاح\n"
+        else:
+            msg += f"   ⚠️ رد غير متوقع\n"
+        msg += "\n"
+        
+        # 4) اختبار Options (الأهم!)
+        msg += "*3️⃣ اختبار Options Snapshot (الأهم):*\n"
+        test3 = polygon_options_aggregate("GLD", return_error=True)
+        if test3.get("_error"):
+            err_type = test3.get('_error')
+            err_msg = test3.get('_message')
+            msg += f"   ❌ {err_msg}\n"
+            if err_type == "plan":
+                msg += "\n💡 *النتيجة:*\n"
+                msg += "خطتك الحالية على Polygon **لا تشمل Options**\n\n"
+                msg += "🔧 *للحل:*\n"
+                msg += "1. اشترك في *Options Starter* ($29/شهر)\n"
+                msg += "   من polygon.io/dashboard\n"
+                msg += "2. أو استمر بدون Options — البوت شغّال 95%\n"
+            elif err_type == "rate_limit":
+                msg += "\n💡 الخطة المجانية محدودة بـ5 طلبات/دقيقة\n"
+        elif test3 and test3.get("underlying"):
+            msg += f"   ✅ Options متاح وشغّال!\n"
+            msg += f"   Calls Vol: {test3.get('calls_volume', 0):,}\n"
+            msg += f"   Puts Vol: {test3.get('puts_volume', 0):,}\n"
+        else:
+            msg += f"   ⚠️ السوق مغلق أو لا توجد بيانات\n"
+        
+        msg += "\n━━━━━━━━━━━━━━━━━━━\n"
+        msg += "💡 *ملاحظة:* البوت شغّال كامل بدون Polygon\n"
+        msg += "Options Sentiment ميزة إضافية فقط"
+        
+        await send_long(u, msg)
         return
     
     if text in ("بنوك", "central banks", "فيد"):
@@ -2205,6 +2479,7 @@ def main():
     print(f"  💎 Gemini:        {'✅' if GEMINI_API_KEY else '⚪'}")
     print(f"  🤖 OpenAI:        {'✅' if OPENAI_API_KEY else '⚪'}")
     print(f"  📊 Polygon:       {'✅' if POLYGON_API_KEY else '⚪'}")
+    print(f"  💎 Options:       {'✅ مُفعّلة' if ENABLE_OPTIONS else '⚪ معطّلة (Currencies plan)'}")
     print(f"  🌍 Trading Econ:  {'✅' if TRADING_ECON_KEY else '⚪'}")
     print(f"  📈 Databento:     {'✅' if DATABENTO_API_KEY else '⚪'}")
     print(f"  🏛️  FRED:          {'✅' if FRED_API_KEY else '⚪'}")
